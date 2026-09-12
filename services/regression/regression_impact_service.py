@@ -1,0 +1,503 @@
+from sqlalchemy.orm import Session
+
+from baseline_models import ScenarioBaseline, OperationBaseline
+from db_models import Scenario
+from services.regression.git_diff_service import GitDiffService
+from services.scenario.scenario_service import ScenarioService
+from config import settings
+from pathlib import Path
+import ast
+
+from services.python.flow.python_endpoint_flow_service import PythonEndpointFlowService
+
+
+class RegressionImpactService:
+    """Compare current Python changes against every active scenario baseline.
+
+    Impact is calculated project-wide. A scenario is DIRECTLY_AFFECTED when a
+    changed Class.method is present in its stored endpoint flow. It is
+    POSSIBLY_AFFECTED when a changed class is part of the baseline dependency
+    set but the exact method is not present in the stored flow. All other
+    registered scenarios are returned as UNAFFECTED so the UI/report can show
+    the complete blast radius instead of only the selected scenario.
+    """
+
+    def __init__(self):
+        self.git_diff_service = GitDiffService()
+
+    def analyse(self, db: Session):
+        changes = self.git_diff_service.analyse_changes()
+
+        # Visible baselines are operation-level.  Every scenario/test case under
+        # the same HTTP operation reuses that active baseline/version.
+        project_path = str(Path(settings.PYTHON_PROJECT_PATH).resolve())
+        operation_baselines = (
+            db.query(OperationBaseline)
+            .filter(
+                OperationBaseline.project_path == project_path,
+                OperationBaseline.is_active.is_(True),
+            )
+            .all()
+        )
+        operation_by_key = {
+            (str(b.http_method).upper(), str(b.endpoint)): b
+            for b in operation_baselines
+        }
+
+        # Backward compatibility for scenarios captured before operation-level
+        # baselines existed.
+        all_scenarios = ScenarioService().get_all_for_active_project(db)
+        active_scenario_ids = [scenario.id for scenario in all_scenarios]
+
+        # Legacy baselines have no project_path column, so isolate them through
+        # their project-scoped scenario IDs.
+        legacy_query = db.query(ScenarioBaseline).filter(
+            ScenarioBaseline.is_active.is_(True)
+        )
+        if active_scenario_ids:
+            legacy_query = legacy_query.filter(
+                ScenarioBaseline.scenario_id.in_(active_scenario_ids)
+            )
+            legacy_baselines = legacy_query.all()
+        else:
+            legacy_baselines = []
+        legacy_by_scenario = {b.scenario_id: b for b in legacy_baselines}
+
+        changed_classes = set()
+        changed_methods = []
+        changed_method_keys = set()
+        for changed_file in changes.get("changed_files", []):
+            file_owner = changed_file.get("class_name")
+            if file_owner:
+                changed_classes.add(file_owner)
+            for method in changed_file.get("changed_methods", []):
+                method_name = method.get("method_name")
+                class_name = method.get("class_name") or file_owner
+                if class_name:
+                    changed_classes.add(class_name)
+                item = {
+                    "class_name": class_name,
+                    "method_name": method_name,
+                    "changed_lines": method.get("changed_lines", []),
+                }
+                changed_methods.append(item)
+                if class_name and method_name:
+                    changed_method_keys.add(f"{class_name}.{method_name}")
+
+        directly_affected = []
+        possibly_affected = []
+        unaffected = []
+
+        for scenario in all_scenarios:
+            key = (str(scenario.http_method or "").upper(), str(scenario.endpoint or ""))
+            operation_baseline = operation_by_key.get(key)
+            legacy = legacy_by_scenario.get(scenario.id)
+
+            if operation_baseline:
+                endpoint_flow = operation_baseline.endpoint_flow
+                baseline_version = operation_baseline.baseline_version
+                scenario_code = scenario.scenario_code
+                http_method = operation_baseline.http_method
+                endpoint = operation_baseline.endpoint
+                declared_classes = set()
+                scenario_contracts = operation_baseline.scenario_contracts or []
+                baseline_scope = "OPERATION"
+            elif legacy:
+                endpoint_flow = legacy.endpoint_flow
+                baseline_version = legacy.baseline_version
+                scenario_code = legacy.scenario_code
+                http_method = legacy.http_method
+                endpoint = legacy.endpoint
+                declared_classes = set(legacy.involved_classes or [])
+                scenario_contracts = []
+                baseline_scope = "LEGACY_SCENARIO"
+            else:
+                unaffected.append({
+                    "scenario_id": scenario.id,
+                    "scenario_code": scenario.scenario_code,
+                    "http_method": scenario.http_method,
+                    "endpoint": scenario.endpoint,
+                    "baseline_version": None,
+                    "baseline_scope": None,
+                    "impact_status": "NO_BASELINE",
+                    "matched_classes": [],
+                    "changed_methods": [],
+                    "dependency_paths": [],
+                    "reason": "No active operation baseline has been captured for this scenario's HTTP operation.",
+                })
+                continue
+
+            flow_classes, flow_methods = self._extract_flow_dependencies(endpoint_flow)
+            dependency_classes = declared_classes | flow_classes
+            matched_classes = sorted(dependency_classes & changed_classes)
+            declared_matched_classes = sorted(declared_classes & changed_classes)
+            contract_matched_classes = self._contract_dependency_matches(
+                scenario_contracts,
+                changed_classes,
+            )
+            matched_method_keys = sorted(flow_methods & changed_method_keys)
+            scenario_methods = [
+                method for method in changed_methods
+                if f"{method['class_name']}.{method.get('method_name')}" in matched_method_keys
+            ]
+            dependency_paths = self._build_dependency_paths(
+                endpoint_flow=endpoint_flow,
+                endpoint_label=f"{http_method} {endpoint}",
+                changed_classes=changed_classes,
+                changed_method_keys=changed_method_keys,
+            )
+            base_result = {
+                "scenario_id": scenario.id,
+                "scenario_code": scenario_code,
+                "baseline_version": baseline_version,
+                "baseline_scope": baseline_scope,
+                "http_method": http_method,
+                "endpoint": endpoint,
+                "matched_classes": matched_classes,
+                "declared_matched_classes": declared_matched_classes,
+                "contract_matched_classes": contract_matched_classes,
+                "matched_methods": matched_method_keys,
+                "changed_methods": scenario_methods,
+                "dependency_paths": dependency_paths,
+            }
+
+            if matched_method_keys or declared_matched_classes:
+                direct_methods = [
+                    method for method in changed_methods
+                    if method["class_name"] in declared_matched_classes
+                    or f"{method['class_name']}.{method.get('method_name')}" in matched_method_keys
+                ]
+                directly_affected.append({
+                    **base_result,
+                    "impact_status": "DIRECTLY_AFFECTED",
+                    "changed_methods": direct_methods,
+                    "reason": "Changed code intersects a method in the operation baseline execution flow.",
+                })
+            elif matched_classes or contract_matched_classes:
+                relevant_classes = set(matched_classes) | set(contract_matched_classes)
+                class_methods = [m for m in changed_methods if m["class_name"] in relevant_classes]
+                reason = (
+                    "Changed Python model/schema is present in the saved scenario request/response contract."
+                    if contract_matched_classes
+                    else "Changed class is used by the operation baseline, but the exact changed method is not recorded in the flow."
+                )
+                possibly_affected.append({
+                    **base_result,
+                    "impact_status": "POSSIBLY_AFFECTED",
+                    "changed_methods": class_methods,
+                    "reason": reason,
+                })
+            else:
+                unaffected.append({
+                    **base_result,
+                    "impact_status": "UNAFFECTED",
+                    "reason": "No changed class or method intersects this operation baseline.",
+                })
+
+        affected_scenarios = directly_affected + possibly_affected
+        affected_operations = self._find_affected_operations(changes)
+        return {
+            "status": "CHANGES_DETECTED" if changes.get("total_changed_java_files", 0) > 0 else "NO_CHANGES",
+            "total_changed_java_files": changes.get("total_changed_java_files", 0),
+            "changed_classes": sorted(changed_classes),
+            "changed_methods": changed_methods,
+            "total_registered_scenarios": len(all_scenarios),
+            "total_directly_affected": len(directly_affected),
+            "total_possibly_affected": len(possibly_affected),
+            "total_unaffected": len(unaffected),
+            "total_affected_scenarios": len(affected_scenarios),
+            "directly_affected": directly_affected,
+            "possibly_affected": possibly_affected,
+            "unaffected_scenarios": unaffected,
+            "affected_scenarios": affected_scenarios,
+            "affected_operations": affected_operations,
+            "total_affected_operations": len(affected_operations),
+            "git_changes": changes,
+            "baseline_model": "OPERATION_LEVEL",
+        }
+
+    @staticmethod
+    def _normalise_symbol(value: str | None) -> str:
+        """Normalise Python/file/API names so address.py, Address and address match."""
+        if not value:
+            return ""
+        return "".join(ch.lower() for ch in str(value) if ch.isalnum())
+
+    def _contract_dependency_matches(self, scenario_contracts, changed_classes: set[str]) -> list[str]:
+        """Return changed model/file names that are represented in saved scenario contracts.
+
+        Python model changes often happen at class scope (for example a SQLAlchemy
+        ``Address`` field addition), so there is no changed method to intersect with
+        the stored execution flow.  The request/expected contract is still strong
+        evidence that the operation depends on that model.
+        """
+        changed_by_normalised = {
+            self._normalise_symbol(name): name
+            for name in changed_classes
+            if self._normalise_symbol(name)
+        }
+        if not changed_by_normalised:
+            return []
+
+        contract_tokens: set[str] = set()
+
+        def walk(value):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    token = self._normalise_symbol(key)
+                    if token:
+                        contract_tokens.add(token)
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(scenario_contracts or [])
+
+        matches = []
+        for normalised, original in changed_by_normalised.items():
+            # Exact key match (Address -> address), plural form, or a nested
+            # compound key such as emailDetails -> email_details.py.
+            singular = normalised[:-1] if normalised.endswith("s") else normalised
+            plural = normalised + "s"
+            if any(
+                token == normalised
+                or token == singular
+                or token == plural
+                or normalised in token
+                or token in normalised
+                for token in contract_tokens
+            ):
+                matches.append(original)
+
+        return sorted(set(matches))
+
+    def _build_dependency_paths(
+        self,
+        endpoint_flow,
+        endpoint_label: str,
+        changed_classes: set[str],
+        changed_method_keys: set[str],
+    ) -> list[dict]:
+        ordered = self._ordered_flow_methods(endpoint_flow)
+        if not ordered:
+            return []
+
+        paths = []
+        for index, method in enumerate(ordered):
+            class_name = method.split(".", 1)[0]
+            if method not in changed_method_keys and class_name not in changed_classes:
+                continue
+
+            # Show enough upstream/downstream context to explain why the scenario
+            # depends on the changed code without dumping the entire flow.
+            start = max(0, index - 3)
+            end = min(len(ordered), index + 4)
+            chain = ordered[start:end]
+            chain = list(dict.fromkeys([endpoint_label, *chain]))
+            paths.append({
+                "changed_symbol": method,
+                "path": chain,
+            })
+
+        # A class can be explicitly declared as involved even when an older stored
+        # flow does not contain a method for it. Keep that evidence visible.
+        covered_classes = {
+            item["changed_symbol"].split(".", 1)[0]
+            for item in paths
+        }
+        for class_name in sorted(changed_classes - covered_classes):
+            if class_name in self._extract_flow_dependencies(endpoint_flow)[0]:
+                paths.append({
+                    "changed_symbol": class_name,
+                    "path": [endpoint_label, class_name],
+                })
+
+        return paths[:8]
+
+    def _ordered_flow_methods(self, endpoint_flow) -> list[str]:
+        result = []
+
+        def add(class_name, method_name):
+            if class_name and method_name:
+                value = f"{class_name}.{method_name}"
+                if value not in result:
+                    result.append(value)
+
+        def walk(value):
+            if isinstance(value, dict):
+                add(value.get("class_name"), value.get("method_name"))
+                # Prefer call order when this is a flow node.
+                calls = value.get("calls")
+                if isinstance(calls, list):
+                    for child in calls:
+                        walk(child)
+                for key, child in value.items():
+                    if key == "calls":
+                        continue
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+            elif isinstance(value, str) and "." in value and " " not in value:
+                parts = value.split(".", 1)
+                if len(parts) == 2:
+                    add(parts[0], parts[1])
+
+        walk(endpoint_flow or {})
+        return result
+
+    def _extract_flow_dependencies(self, endpoint_flow):
+        classes = set()
+        methods = set()
+
+        def walk(value):
+            if isinstance(value, dict):
+                class_name = value.get("class_name")
+                method_name = value.get("method_name")
+                if class_name:
+                    classes.add(str(class_name))
+                    if method_name:
+                        methods.add(f"{class_name}.{method_name}")
+
+                for child in value.values():
+                    walk(child)
+
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+            elif isinstance(value, str):
+                # simplified_flow stores labels such as EmployeeMapper.toEntity
+                if "." in value and " " not in value:
+                    parts = value.split(".", 1)
+                    if len(parts) == 2 and parts[0] and parts[1]:
+                        classes.add(parts[0])
+                        methods.add(value)
+
+        walk(endpoint_flow or {})
+        return classes, methods
+
+    def _find_affected_operations(self, changes: dict) -> list[dict]:
+        """Find impacted FastAPI operations directly from current source, independent of Scenario Registry."""
+        try:
+            endpoint_service = PythonEndpointFlowService()
+            endpoints = endpoint_service.discover_endpoints()
+        except Exception:
+            return []
+
+        changed_abs = set()
+        changed_names = set()
+        changed_symbols = set()
+        git_root = Path(changes.get("git_root") or settings.PYTHON_PROJECT_PATH).resolve()
+        for item in changes.get("changed_files", []):
+            rel = item.get("file_path")
+            if rel:
+                changed_abs.add(str((git_root / rel).resolve()))
+                changed_names.add(Path(rel).stem.lower())
+            owner = item.get("class_name")
+            if owner:
+                changed_names.add(str(owner).lower())
+            for ch in item.get("source_changes", []) or []:
+                if ch.get("symbol"):
+                    changed_symbols.add(str(ch["symbol"]).lower())
+
+        class_index = self._python_class_index(Path(settings.PYTHON_PROJECT_PATH).resolve())
+        results = []
+        for endpoint in endpoints:
+            reasons = []
+            evidence = []
+            try:
+                analysed = endpoint_service.analyze_endpoint(endpoint["http_method"], endpoint["endpoint"])
+                for step in analysed.get("simplified_flow", []) or []:
+                    file_path = step.get("file_path")
+                    if file_path and str(Path(file_path).resolve()) in changed_abs:
+                        reasons.append("Changed file is in this operation's execution flow")
+                        evidence.append(step.get("label") or f"{step.get('class_name')}.{step.get('method_name')}")
+            except Exception:
+                pass
+
+            contract_hits = self._endpoint_contract_hits(endpoint, changed_abs, class_index)
+            if contract_hits:
+                reasons.append("Changed schema/model is used by this operation's request or response contract")
+                evidence.extend(contract_hits)
+
+            # lightweight import fallback for schema modules referenced by the route module
+            try:
+                route_path = Path(endpoint.get("file_path") or "")
+                text = route_path.read_text(encoding="utf-8", errors="ignore").lower()
+                imported = [name for name in changed_names if name and name in text]
+                if imported and not reasons:
+                    reasons.append("Route module references the changed Python module/model")
+                    evidence.extend(sorted(imported))
+            except Exception:
+                pass
+
+            if reasons:
+                results.append({
+                    "http_method": endpoint.get("http_method"),
+                    "endpoint": endpoint.get("endpoint"),
+                    "handler": f"{endpoint.get('class_name')}.{endpoint.get('method_name')}",
+                    "file_path": endpoint.get("file_path"),
+                    "reason": "; ".join(dict.fromkeys(reasons)),
+                    "evidence": list(dict.fromkeys([e for e in evidence if e]))[:8],
+                })
+
+        seen = set(); clean=[]
+        for item in results:
+            key=(item.get("http_method"), item.get("endpoint"))
+            if key not in seen:
+                seen.add(key); clean.append(item)
+        return sorted(clean, key=lambda x: (x.get("endpoint") or "", x.get("http_method") or ""))
+
+    @staticmethod
+    def _python_class_index(root: Path) -> dict[str, str]:
+        index = {}
+        ignored = {".git", ".venv", "venv", "env", "__pycache__", "site-packages", "build", "dist"}
+        for path in root.rglob("*.py"):
+            if any(part in ignored for part in path.parts):
+                continue
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+            except Exception:
+                continue
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    index[node.name] = str(path.resolve())
+        return index
+
+    @staticmethod
+    def _endpoint_contract_hits(endpoint: dict, changed_abs: set[str], class_index: dict[str, str]) -> list[str]:
+        path = Path(endpoint.get("file_path") or "")
+        if not path.exists():
+            return []
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            return []
+        target = None
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == endpoint.get("method_name"):
+                target = node; break
+        if target is None:
+            return []
+        names = set()
+        args = list(target.args.posonlyargs) + list(target.args.args) + list(target.args.kwonlyargs)
+        for arg in args:
+            if arg.annotation is not None:
+                for n in ast.walk(arg.annotation):
+                    if isinstance(n, ast.Name): names.add(n.id)
+                    elif isinstance(n, ast.Attribute): names.add(n.attr)
+        if target.returns is not None:
+            for n in ast.walk(target.returns):
+                if isinstance(n, ast.Name): names.add(n.id)
+                elif isinstance(n, ast.Attribute): names.add(n.attr)
+        for dec in target.decorator_list:
+            if isinstance(dec, ast.Call):
+                for kw in dec.keywords:
+                    if kw.arg == "response_model":
+                        for n in ast.walk(kw.value):
+                            if isinstance(n, ast.Name): names.add(n.id)
+                            elif isinstance(n, ast.Attribute): names.add(n.attr)
+        return sorted(name for name in names if class_index.get(name) in changed_abs)
