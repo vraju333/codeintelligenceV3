@@ -666,25 +666,36 @@ async function runInvestigation() {
     let expected;
     let actual;
 
-    const inputText = document.getElementById("inputJson").value.trim();
-    const expectedText = document.getElementById("expectedJson").value.trim();
-    const actualText = document.getElementById("actualJson").value.trim();
-
-    if (!actualText) {
-        container.innerHTML = renderError(
-            "Actual JSON is required for defect investigation. Paste the real application response first."
-        );
-        return;
-    }
-
     try {
-        input = JSON.parse(inputText);
-        expected = JSON.parse(expectedText);
-        actual = JSON.parse(actualText);
+
+        input =
+            JSON.parse(
+                document.getElementById(
+                    "inputJson"
+                ).value
+            );
+
+        expected =
+            JSON.parse(
+                document.getElementById(
+                    "expectedJson"
+                ).value
+            );
+
+        actual =
+            JSON.parse(
+                document.getElementById(
+                    "actualJson"
+                ).value
+            );
+
     } catch (error) {
-        container.innerHTML = renderError(
-            "Input, Expected or Actual JSON is invalid."
-        );
+
+        container.innerHTML =
+            renderError(
+                "Input, Expected or Actual JSON is invalid."
+            );
+
         return;
     }
 
@@ -1271,6 +1282,11 @@ async function openMainBaselineModal(scenarioId) {
     const error = document.getElementById("mainBaselineError");
     if (error) error.textContent = "";
 
+    // Open immediately. Loading history should never make the button appear broken
+    // when the API is slow or temporarily unavailable.
+    modal.classList.add("open");
+    modal.setAttribute("aria-hidden", "false");
+
     try {
         const response = await fetch(`/api/scenario-baselines/history/${scenarioId}`);
         const data = await response.json();
@@ -1293,9 +1309,6 @@ async function openMainBaselineModal(scenarioId) {
     const name = document.getElementById("mainBaselineName");
     if (name) name.value = "";
     onMainBaselineReleaseChanged();
-
-    modal.classList.add("open");
-    modal.setAttribute("aria-hidden", "false");
 }
 
 function onMainBaselineReleaseChanged() {
@@ -1767,7 +1780,7 @@ async function loadBaselineHistory() {
         const previous = data.filter(item => item.id !== active.id);
         container.innerHTML = `
             <div class="active-baseline-card">
-                <div><span class="muted-text">Current baseline</span><h3>${escapeHtml(active.scenario_code)} · V${active.baseline_version}</h3></div>
+                <div><span class="muted-text">Current baseline</span><h3>${escapeHtml(active.baseline_name || "Main Baseline")} · V${active.baseline_version}</h3></div>
                 <span class="tag">ACTIVE</span>
                 <div class="baseline-detail">${escapeHtml(active.http_method)} ${escapeHtml(active.endpoint)}</div>
                 <div class="baseline-detail">Flow: ${active.endpoint_flow ? "stored" : "not stored"}</div>
