@@ -502,7 +502,10 @@ class ScenarioBaselineService:
         )
         source_changed = current_source != (latest_snapshot.source_snapshot or {})
         flow_changed = self._flow_signature(endpoint_flow) != self._flow_signature(latest.endpoint_flow)
-        return source_changed or flow_changed
+        git_diff_changed = bool(
+            self._current_git_diff(project_path).strip()
+        )
+        return source_changed or flow_changed or git_diff_changed
 
     def _ensure_relevant_change_before_new_version(
         self,
@@ -664,14 +667,23 @@ class ScenarioBaselineService:
         if not project_path.exists():
             return result
 
-        wanted = {
-            str(name).split(".")[-1]
-            for name in class_names
-            if name
+        ignored_dirs = {
+            ".git",
+            ".idea",
+            ".vscode",
+            ".venv",
+            "venv",
+            "env",
+            "__pycache__",
+            "site-packages",
+            "node_modules",
+            "dist",
+            "build",
+            ".pytest_cache",
         }
 
         for java_file in project_path.rglob("*.py"):
-            if wanted and java_file.stem not in wanted:
+            if any(part in ignored_dirs for part in java_file.parts):
                 continue
 
             try:
@@ -1081,12 +1093,28 @@ class ScenarioBaselineService:
             })
 
         # Prefer the Git classification captured with V2 because it identifies
-        # Java fields/methods cleanly.  Snapshot file comparison remains the
-        # durable evidence even after Git moves on.
+        # changed files/symbols cleanly. Snapshot comparison remains useful, but
+        # older Python baselines may have stored only a narrow scenario snapshot
+        # while newer baselines store the whole Python source tree. In that
+        # mixed case, unchanged existing files look like false ADDED files.
         changes = (
             new_snapshot.source_changes
             or []
         )
+        git_changed_files = (
+            self._files_from_git_changes(changes)
+            or self._files_from_raw_git_diff(new_snapshot.git_diff or "")
+        )
+
+        added_only_from_snapshot_shape_change = (
+            git_changed_files
+            and changed_files
+            and all(item.get("status") == "ADDED" for item in changed_files)
+            and len(changed_files) > len(git_changed_files)
+        )
+
+        if added_only_from_snapshot_shape_change:
+            changed_files = git_changed_files
 
         return {
             "snapshot_status": "AVAILABLE",
@@ -1127,6 +1155,47 @@ class ScenarioBaselineService:
         return list(
             files.values()
         )
+
+
+    def _files_from_raw_git_diff(
+        self,
+        raw_diff: str
+    ) -> list[dict]:
+        files = {}
+
+        if not raw_diff:
+            return []
+
+        current_old_path = None
+
+        for line in raw_diff.splitlines():
+            if line.startswith("--- a/"):
+                current_old_path = line[6:].strip()
+                continue
+
+            if not line.startswith("+++ b/"):
+                continue
+
+            new_path = line[6:].strip()
+            if not new_path or new_path == "/dev/null":
+                path = current_old_path
+                status = "REMOVED"
+            elif current_old_path in (None, "/dev/null"):
+                path = new_path
+                status = "ADDED"
+            else:
+                path = new_path
+                status = "MODIFIED"
+
+            if not path:
+                continue
+
+            files[path] = {
+                "file_path": path,
+                "status": status
+            }
+
+        return list(files.values())
 
 
     def _flow_methods(self, flow):

@@ -223,8 +223,97 @@ class PythonCodeFlowService:
             "file_path": str(symbol.file_path),
             "line_number": getattr(symbol.node, "lineno", None),
             "end_line_number": getattr(symbol.node, "end_lineno", None),
+            "input_parameters": PythonCodeFlowService._method_parameters(symbol.node),
+            "return_type": PythonCodeFlowService._return_type(symbol.node),
             "found": True,
         }
+
+    @staticmethod
+    def _method_parameters(node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[dict]:
+        parameters = []
+        args = list(node.args.posonlyargs) + list(node.args.args)
+
+        defaults_offset = len(args) - len(node.args.defaults)
+
+        for index, arg in enumerate(args):
+            if arg.arg in {"self", "cls"}:
+                continue
+
+            annotation = PythonCodeFlowService._annotation_text(arg.annotation)
+            default_value = None
+
+            if index >= defaults_offset and node.args.defaults:
+                default_index = index - defaults_offset
+                default_value = PythonCodeFlowService._annotation_text(
+                    node.args.defaults[default_index]
+                )
+
+            display = arg.arg
+            if annotation:
+                display = f"{arg.arg}: {annotation}"
+            if default_value:
+                display = f"{display} = {default_value}"
+
+            parameters.append(
+                {
+                    "name": arg.arg,
+                    "type": annotation or "",
+                    "default": default_value or "",
+                    "display": display
+                }
+            )
+
+        if node.args.vararg:
+            parameters.append(
+                {
+                    "name": node.args.vararg.arg,
+                    "type": PythonCodeFlowService._annotation_text(node.args.vararg.annotation) or "",
+                    "default": "",
+                    "display": f"*{node.args.vararg.arg}"
+                }
+            )
+
+        for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            annotation = PythonCodeFlowService._annotation_text(arg.annotation)
+            default_value = PythonCodeFlowService._annotation_text(default)
+            display = arg.arg
+            if annotation:
+                display = f"{arg.arg}: {annotation}"
+            if default_value:
+                display = f"{display} = {default_value}"
+            parameters.append(
+                {
+                    "name": arg.arg,
+                    "type": annotation or "",
+                    "default": default_value or "",
+                    "display": display
+                }
+            )
+
+        if node.args.kwarg:
+            parameters.append(
+                {
+                    "name": node.args.kwarg.arg,
+                    "type": PythonCodeFlowService._annotation_text(node.args.kwarg.annotation) or "",
+                    "default": "",
+                    "display": f"**{node.args.kwarg.arg}"
+                }
+            )
+
+        return parameters
+
+    @staticmethod
+    def _return_type(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        return PythonCodeFlowService._annotation_text(node.returns) or "Nothing"
+
+    @staticmethod
+    def _annotation_text(node: ast.AST | None) -> str | None:
+        if node is None:
+            return None
+        try:
+            return ast.unparse(node)
+        except Exception:
+            return getattr(node, "id", None)
 
     @staticmethod
     def flatten(flow: dict) -> list[dict]:

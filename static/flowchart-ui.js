@@ -23,16 +23,30 @@ function ciFlowKind(label) {
 
 
 function ciFlowInputText(node) {
-    const params = Array.isArray(node?.input_parameters) ? node.input_parameters : [];
-    if (!params.length) return "Nothing";
-    return params.map(param => {
-        if (typeof param === "string") return param;
-        return param?.display || [param?.type, param?.name].filter(Boolean).join(" ") || "parameter";
-    }).join(", ");
+    const rawParams = Array.isArray(node?.input_parameters)
+        ? node.input_parameters
+        : (Array.isArray(node?.parameters) ? node.parameters : []);
+
+    const params = rawParams
+        .map(param => {
+            if (typeof param === "string") return param.trim();
+            if (!param || typeof param !== "object") return "";
+
+            const display = cleanFlowText(param.display);
+            if (display) return display;
+
+            const type = cleanFlowText(param.type);
+            const name = cleanFlowText(param.name);
+            return [name, type ? `: ${type}` : ""].join("").trim();
+        })
+        .filter(Boolean)
+        .filter(value => value.toLowerCase() !== "undefined");
+
+    return params.length ? params.join(", ") : "Nothing";
 }
 
 function ciFlowOutputText(node) {
-    const raw = String(node?.return_type || "").trim();
+    const raw = cleanFlowText(node?.return_type || node?.returns);
     if (!raw) return "Nothing";
 
     // Keep the hover focused on the actual Python symbol, not declaration
@@ -43,6 +57,15 @@ function ciFlowOutputText(node) {
 
     if (!cleaned || cleaned.toLowerCase() === "void") return "Nothing";
     return cleaned;
+}
+
+function cleanFlowText(value) {
+    if (value === null || value === undefined) return "";
+    const text = String(value).trim();
+    if (!text || text.toLowerCase() === "undefined" || text.toLowerCase() === "none") {
+        return "";
+    }
+    return text;
 }
 
 function ciFlowFileText(node) {
@@ -96,7 +119,7 @@ function ciRenderFlowNode(id, graph, ancestry = new Set()) {
                 <span>${escapeHtml(kind)}</span>
                 <strong>${escapeHtml(label)}</strong>
                 <div class="ci-flow-tooltip" role="tooltip">
-                    <div class="ci-flow-tooltip-title">${escapeHtml(node?.class_name || "")}\.${escapeHtml(node?.method_name || "")}</div>
+                    <div class="ci-flow-tooltip-title">${escapeHtml(cleanFlowText(node?.class_name) || "Python")}.${escapeHtml(cleanFlowText(node?.method_name) || "method")}</div>
                     <div class="ci-flow-tooltip-row"><b>Input</b><code>${escapeHtml(ciFlowInputText(node))}</code></div>
                     <div class="ci-flow-tooltip-row"><b>Output</b><code>${escapeHtml(ciFlowOutputText(node))}</code></div>
                     ${ciFlowFileText(node) ? `<div class="ci-flow-tooltip-row"><b>File</b><code>${escapeHtml(ciFlowFileText(node))}</code></div>` : ""}

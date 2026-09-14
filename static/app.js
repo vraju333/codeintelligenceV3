@@ -1516,8 +1516,16 @@ async function openTestingBaselineModal(scenarioId) {
     const groups = groupBaselineReleases(testingBaselineVersionItems);
     const releaseSelect = document.getElementById("testingBaselineReleaseSelect");
     if (releaseSelect) {
-        releaseSelect.innerHTML = [...groups.keys()].map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
-        if (item.active_baseline_name && groups.has(item.active_baseline_name)) releaseSelect.value = item.active_baseline_name;
+        const releaseNames = [...groups.keys()];
+        releaseSelect.innerHTML = releaseNames.length
+            ? releaseNames.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")
+            : `<option value="">No baseline versions found</option>`;
+
+        if (item.active_baseline_name && groups.has(item.active_baseline_name)) {
+            releaseSelect.value = item.active_baseline_name;
+        } else if (releaseNames.length) {
+            releaseSelect.value = releaseNames[0];
+        }
     }
     onTestingBaselineReleaseChanged();
 
@@ -1525,6 +1533,12 @@ async function openTestingBaselineModal(scenarioId) {
         const el = document.getElementById(id);
         if (el) el.value = "";
     });
+
+    const nameInput = document.getElementById("testingBaselineName");
+    if (nameInput && item.active_baseline_name) {
+        nameInput.value = item.active_baseline_name;
+    }
+
     const error = document.getElementById("testingBaselineError");
     if (error) error.textContent = "";
 
@@ -1558,9 +1572,11 @@ function onTestingBaselineReleaseChanged() {
     const versions = testingBaselineVersionItems
         .filter(x => String(x.baseline_name || "Legacy") === release)
         .sort((a,b) => releaseDisplayVersion(a) - releaseDisplayVersion(b));
-    versionSelect.innerHTML = versions.map(x =>
-        `<option value="${x.id}">V${releaseDisplayVersion(x)}</option>`
-    ).join("");
+    versionSelect.innerHTML = versions.length
+        ? versions.map(x =>
+            `<option value="${x.id}">V${releaseDisplayVersion(x)}</option>`
+        ).join("")
+        : `<option value="">No versions found</option>`;
     const active = versions.find(x => x.is_active) || versions[versions.length - 1];
     if (active) versionSelect.value = String(active.id);
     onTestingBaselineVersionChanged();
@@ -1625,8 +1641,11 @@ async function saveTestingBaseline() {
             if (jiraSelect) jiraSelect.value = "";
         }
 
-        const selectedBaselineId = Number(document.getElementById("testingBaselineVersionSelect")?.value || 0);
-        if (!selectedBaselineId) throw new Error("Select a Release and Version.");
+        const selectedBaselineId = Number(
+            document.getElementById("testingBaselineVersionSelect")?.value
+            || item.active_baseline_id
+            || 0
+        ) || null;
 
         const body = {
             baseline_name: name,
