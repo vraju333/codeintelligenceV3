@@ -1,4 +1,5 @@
 import json
+import ast
 import re
 import subprocess
 from pathlib import Path
@@ -15,6 +16,8 @@ from repositories.scenario_baseline_repository import (
 )
 from repositories.scenario_repository import ScenarioRepository
 from services.scenario.scenario_service import ScenarioService
+from services.scenario.source_snapshot_diff import capture_sources, compare_sources, unpack, path_key
+from services.scenario.baseline_risk_report import build_risk_report
 
 
 class ScenarioBaselineService:
@@ -416,11 +419,7 @@ class ScenarioBaselineService:
         # scenario, not every edit in a broad parent entity that happens to
         # appear in its stored execution flow. Example: adding Student.eligibility
         # must not make STUDENT_CONTACT_UPDATE look changed.
-        source_comparison = self._filter_source_comparison_for_scenario(
-            scenario_code=scenario.scenario_code,
-            endpoint=new.endpoint,
-            source_comparison=source_comparison,
-        )
+        # Keep exact file evidence separate from potential scenario impact.
 
         endpoint_changed = old.endpoint != new.endpoint or old.http_method != new.http_method
         db_effect_changed = old.expected_db_effect != new.expected_db_effect
@@ -436,7 +435,30 @@ class ScenarioBaselineService:
         source_change_count = len(source_comparison.get("changes") or [])
         changed_file_count = len(source_comparison.get("changed_files") or [])
 
+        dependencies = old_classes | new_classes | self._flow_classes(old.endpoint_flow) | self._flow_classes(new.endpoint_flow)
+        names = {str(name).split('.')[-1] for name in dependencies}
+        matched_modules = set()
+        for baseline in (old, new):
+            record = self.baseline_repository.find_source_snapshot(db, baseline.id)
+            files, _ = unpack(record.source_snapshot if record else None)
+            for path, content in files.items():
+                try:
+                    declared = {node.name for node in ast.walk(ast.parse(content)) if isinstance(node, ast.ClassDef)}
+                except SyntaxError:
+                    continue
+                if names & declared:
+                    matched_modules.add(Path(path).stem)
+        tests = self.baseline_repository.find_test_baselines_for_code_version(db, scenario_id, to_version)
+        risk_report = build_risk_report(source_comparison, endpoint_changed, db_effect_changed,
+                                       added_methods, removed_methods, tests, scenario.scenario_code,
+                                       dependencies | matched_modules)
+
         return {
+            "risk_report": risk_report,
+            "from_release_name": old.baseline_name,
+            "to_release_name": new.baseline_name,
+            "from_release_version": old.release_version or old.baseline_version,
+            "to_release_version": new.release_version or new.baseline_version,
             "scenario_id": scenario_id,
             "scenario_code": scenario.scenario_code,
             "from_version": from_version,
@@ -500,12 +522,12 @@ class ScenarioBaselineService:
             project_path=project_path,
             class_names=class_names,
         )
-        source_changed = current_source != (latest_snapshot.source_snapshot or {})
+        previous, _ = unpack(latest_snapshot.source_snapshot)
+        if latest_snapshot.source_snapshot.get("format_version") != 2:
+            current_source = {path: text.replace("\r\n", "\n").replace("\r", "\n") for path, text in current_source.items()}
+        source_changed = current_source != previous
         flow_changed = self._flow_signature(endpoint_flow) != self._flow_signature(latest.endpoint_flow)
-        git_diff_changed = bool(
-            self._current_git_diff(project_path).strip()
-        )
-        return source_changed or flow_changed or git_diff_changed
+        return source_changed or flow_changed
 
     def _ensure_relevant_change_before_new_version(
         self,
@@ -531,7 +553,9 @@ class ScenarioBaselineService:
         # the code is unchanged, so allow one capture to establish the new
         # source-aware history. From then on duplicate versions are blocked.
         if latest_snapshot and latest_snapshot.source_snapshot is not None:
-            previous_source = latest_snapshot.source_snapshot or {}
+            previous_source, _ = unpack(latest_snapshot.source_snapshot)
+            if latest_snapshot.source_snapshot.get("format_version") != 2:
+                current_source = {path: text.replace("\r\n", "\n").replace("\r", "\n") for path, text in current_source.items()}
             source_changed = current_source != previous_source
             flow_changed = self._flow_signature(endpoint_flow) != self._flow_signature(latest.endpoint_flow)
 
@@ -588,10 +612,7 @@ class ScenarioBaselineService:
                 )
             )
 
-            snapshot = self._read_relevant_java_sources(
-                project_path=project_path,
-                class_names=class_names
-            )
+            snapshot = capture_sources(project_path)
 
             git_diff = self._current_git_diff(
                 project_path
@@ -657,51 +678,12 @@ class ScenarioBaselineService:
         return classes
 
 
-    def _read_relevant_java_sources(
-        self,
-        project_path: Path,
-        class_names: set[str]
-    ) -> dict:
-        result = {}
-
-        if not project_path.exists():
-            return result
-
-        ignored_dirs = {
-            ".git",
-            ".idea",
-            ".vscode",
-            ".venv",
-            "venv",
-            "env",
-            "__pycache__",
-            "site-packages",
-            "node_modules",
-            "dist",
-            "build",
-            ".pytest_cache",
-        }
-
-        for java_file in project_path.rglob("*.py"):
-            if any(part in ignored_dirs for part in java_file.parts):
-                continue
-
-            try:
-                relative = str(
-                    java_file.relative_to(
-                        project_path
-                    )
-                ).replace("\\\\", "/")
-
-                result[relative] = (
-                    java_file.read_text(
-                        encoding="utf-8"
-                    )
-                )
-            except Exception:
-                continue
-
-        return result
+    def _read_relevant_java_sources(self, project_path: Path, class_names: set[str]) -> dict:
+        """Compatibility name: capture Python files for duplicate detection."""
+        snapshot = capture_sources(project_path)
+        if not snapshot["complete"]:
+            raise HTTPException(status_code=409, detail="Some Python sources could not be read; retry after resolving file access.")
+        return snapshot["files"]
 
 
     def _git_root(
@@ -1018,120 +1000,44 @@ class ScenarioBaselineService:
         project_mismatch = bool(
             old_project_path
             and new_project_path
-            and Path(old_project_path).resolve() != Path(new_project_path).resolve()
+            and path_key(old_project_path) != path_key(new_project_path)
         )
 
-        # If the older baseline predates this feature, the Git diff captured
-        # alongside the newer baseline is the best available V1 -> V2 evidence.
-        if not old_snapshot and new_snapshot:
+        if project_mismatch:
             return {
-                "snapshot_status": "PREVIOUS_SNAPSHOT_UNAVAILABLE",
+                "snapshot_status": "PROJECT_MISMATCH",
                 "from_project_path": old_project_path,
                 "to_project_path": new_project_path,
-                "project_mismatch": False,
-                "message": (
-                    f"V{old_baseline.baseline_version} was captured before "
-                    "source snapshots were enabled. Showing the Git changes "
-                    f"stored when V{new_baseline.baseline_version} was captured."
-                ),
-                "changed_files": self._files_from_git_changes(
-                    new_snapshot.source_changes or []
-                ),
-                "changes": new_snapshot.source_changes or [],
-                "raw_diff": new_snapshot.git_diff or ""
+                "project_mismatch": True,
+                "message": "These versions belong to different project paths; source comparison is unavailable.",
+                "changed_files": [], "changes": [], "raw_diff": ""
             }
 
-        if not old_snapshot or not new_snapshot:
+        if (not old_snapshot or not new_snapshot
+                or old_snapshot.source_snapshot is None or new_snapshot.source_snapshot is None):
             return {
                 "snapshot_status": "UNAVAILABLE",
                 "from_project_path": old_project_path,
                 "to_project_path": new_project_path,
                 "project_mismatch": False,
                 "message": (
-                    "Source snapshots are unavailable for one or both versions."
+                    "Source snapshots are unavailable for one or both versions. "
+                    "A working-tree Git diff cannot reconstruct this historical comparison."
                 ),
                 "changed_files": [],
                 "changes": [],
                 "raw_diff": ""
             }
 
-        old_sources = old_snapshot.source_snapshot or {}
-        new_sources = new_snapshot.source_snapshot or {}
-
-        old_files = set(
-            old_sources
-        )
-        new_files = set(
-            new_sources
-        )
-
-        changed_files = []
-
-        for file_path in sorted(
-            old_files | new_files
-        ):
-            before = old_sources.get(
-                file_path
-            )
-            after = new_sources.get(
-                file_path
-            )
-
-            if before == after:
-                continue
-
-            if before is None:
-                status = "ADDED"
-            elif after is None:
-                status = "REMOVED"
-            else:
-                status = "MODIFIED"
-
-            changed_files.append({
-                "file_path": file_path,
-                "status": status
-            })
-
-        # Prefer the Git classification captured with V2 because it identifies
-        # changed files/symbols cleanly. Snapshot comparison remains useful, but
-        # older Python baselines may have stored only a narrow scenario snapshot
-        # while newer baselines store the whole Python source tree. In that
-        # mixed case, unchanged existing files look like false ADDED files.
-        changes = (
-            new_snapshot.source_changes
-            or []
-        )
-        git_changed_files = (
-            self._files_from_git_changes(changes)
-            or self._files_from_raw_git_diff(new_snapshot.git_diff or "")
-        )
-
-        added_only_from_snapshot_shape_change = (
-            git_changed_files
-            and changed_files
-            and all(item.get("status") == "ADDED" for item in changed_files)
-            and len(changed_files) > len(git_changed_files)
-        )
-
-        if added_only_from_snapshot_shape_change:
-            changed_files = git_changed_files
-
-        return {
-            "snapshot_status": "AVAILABLE",
+        comparison = compare_sources(old_snapshot.source_snapshot, new_snapshot.source_snapshot)
+        comparison.update({
             "from_project_path": old_project_path,
             "to_project_path": new_project_path,
-            "project_mismatch": project_mismatch,
-            "message": (
-                "These two baselines were captured from different Python project paths. "
-                "Execution-flow differences are shown, but they must not be interpreted "
-                "as source-file additions or deletions across one project."
-                if project_mismatch
-                else None
-            ),
-            "changed_files": ([] if project_mismatch else changed_files),
-            "changes": ([] if project_mismatch else changes),
-            "raw_diff": ("" if project_mismatch else (new_snapshot.git_diff or ""))
-        }
+            "project_mismatch": False,
+            "changes": [],
+            "scope": "Stored Python source files; file changes are not proof of scenario impact",
+        })
+        return comparison
 
 
     def _files_from_git_changes(
