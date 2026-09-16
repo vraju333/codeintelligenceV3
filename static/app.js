@@ -1424,6 +1424,49 @@ let activeTestingBaselineScenarioId = null;
 let testingBaselineJiraIds = [];
 let testingBaselineVersionItems = [];
 
+function ensureTestingBaselineSelectors() {
+    const modal = document.getElementById("testingBaselineModal");
+    if (!modal) return;
+
+    const scroll = modal.querySelector(".scenario-create-scroll");
+    const nameInput = document.getElementById("testingBaselineName");
+    if (!scroll || !nameInput) return;
+
+    const nameLabel = nameInput.closest("label");
+    if (nameLabel) {
+        const textNode = Array.from(nameLabel.childNodes)
+            .find(node => node.nodeType === Node.TEXT_NODE && String(node.textContent || "").trim());
+        if (textNode) textNode.textContent = "Test Scenario Name\n";
+    }
+    nameInput.placeholder = "e.g. Student add happy path test";
+
+    if (document.getElementById("testingBaselineReleaseSelect") && document.getElementById("testingBaselineVersionSelect")) {
+        return;
+    }
+
+    const baselineBlock = document.createElement("div");
+    baselineBlock.id = "testingBaselineSelectorBlock";
+    baselineBlock.innerHTML = `
+        <div class="scenario-create-grid">
+            <label>Existing Code Baseline
+                <select id="testingBaselineReleaseSelect" onchange="onTestingBaselineReleaseChanged()">
+                    <option value="">Loading baselines...</option>
+                </select>
+            </label>
+            <label>Version
+                <select id="testingBaselineVersionSelect" onchange="onTestingBaselineVersionChanged()">
+                    <option value="">Select version...</option>
+                </select>
+            </label>
+        </div>
+        <label>Selected Code Baseline
+            <input id="testingMainBaselineDisplay" readonly type="text" value=""/>
+        </label>
+    `;
+
+    scroll.insertBefore(baselineBlock, nameLabel || scroll.firstChild);
+}
+
 async function loadTestingBaselineJiraOptions() {
     const select = document.getElementById("testingBaselineJiraSelect");
     if (!select) return;
@@ -1496,6 +1539,7 @@ async function openTestingBaselineModal(scenarioId) {
     const modal = document.getElementById("testingBaselineModal");
     const item = baselineOverviewData.find(x => Number(x.scenario_id) === Number(scenarioId));
     if (!modal || !item) return;
+    ensureTestingBaselineSelectors();
     if (!item.baseline_captured) {
         alert("Create a baseline version first.");
         return;
@@ -1513,6 +1557,17 @@ async function openTestingBaselineModal(scenarioId) {
     } catch (_) {
         testingBaselineVersionItems = [];
     }
+
+    if (!testingBaselineVersionItems.length && item.active_baseline_id) {
+        testingBaselineVersionItems = [{
+            id: item.active_baseline_id,
+            baseline_name: item.active_baseline_name || "Current Baseline",
+            release_version: item.active_release_version || item.active_baseline_version || 1,
+            baseline_version: item.active_baseline_version || item.active_release_version || 1,
+            is_active: true
+        }];
+    }
+
     const groups = groupBaselineReleases(testingBaselineVersionItems);
     const releaseSelect = document.getElementById("testingBaselineReleaseSelect");
     if (releaseSelect) {
@@ -1533,11 +1588,6 @@ async function openTestingBaselineModal(scenarioId) {
         const el = document.getElementById(id);
         if (el) el.value = "";
     });
-
-    const nameInput = document.getElementById("testingBaselineName");
-    if (nameInput && item.active_baseline_name) {
-        nameInput.value = item.active_baseline_name;
-    }
 
     const error = document.getElementById("testingBaselineError");
     if (error) error.textContent = "";
@@ -1818,6 +1868,98 @@ async function loadBaselineHistory() {
 
 function downloadScenarioExcel() {
     window.location.href = "/api/reports/regression/excel";
+}
+
+async function loadJiraHistoryBoard() {
+    const select = document.getElementById("jiraHistorySelect");
+    const result = document.getElementById("jiraHistoryBoardResult");
+    if (!select || !result) return;
+
+    result.innerHTML = "Loading saved JIRAs...";
+    select.innerHTML = `<option value="">Loading saved JIRAs...</option>`;
+    try {
+        const response = await fetch("/api/jira-knowledge");
+        const data = await response.json();
+        if (!response.ok) throw new Error(JSON.stringify(data));
+
+        const items = Array.isArray(data) ? data : [];
+        if (!items.length) {
+            select.innerHTML = `<option value="">No saved JIRAs available</option>`;
+            result.innerHTML = `<div class="muted-box">No saved JIRAs found. Save a JIRA in JIRA Impact Analysis first, then attach it while adding a Testing Baseline.</div>`;
+            return;
+        }
+
+        select.innerHTML = `<option value="">Select a saved JIRA...</option>` + items.map(item => {
+            const jiraId = String(item.jira_id || "").trim().toUpperCase();
+            const title = String(item.title || "").trim();
+            const label = title ? `${jiraId} — ${title}` : jiraId;
+            return `<option value="${escapeHtml(jiraId)}">${escapeHtml(label)}</option>`;
+        }).join("");
+        result.innerHTML = `<div class="muted-box">Choose a JIRA and click View Coverage.</div>`;
+    } catch (error) {
+        select.innerHTML = `<option value="">Unable to load JIRAs</option>`;
+        result.innerHTML = renderError(error.message);
+    }
+}
+
+async function loadSelectedJiraCoverage() {
+    const select = document.getElementById("jiraHistorySelect");
+    const result = document.getElementById("jiraHistoryBoardResult");
+    if (!select || !result) return;
+
+    const jiraId = String(select.value || "").trim().toUpperCase();
+    if (!jiraId) {
+        result.innerHTML = `<div class="warning">Select a JIRA first.</div>`;
+        return;
+    }
+
+    result.innerHTML = `Loading baseline coverage for ${escapeHtml(jiraId)}...`;
+    try {
+        const response = await fetch(`/api/scenario-baselines/jira-coverage/${encodeURIComponent(jiraId)}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(JSON.stringify(data));
+        result.innerHTML = renderJiraCoverage(data);
+    } catch (error) {
+        result.innerHTML = renderError(error.message);
+    }
+}
+
+function renderJiraCoverage(data) {
+    const items = Array.isArray(data.items) ? data.items : [];
+    const jiraId = data.jira_id || "";
+
+    if (!items.length) {
+        return `
+            <div class="jira-history-text-board">
+                <h3>JIRA: ${escapeHtml(jiraId)}</h3>
+                <div class="muted-box">No baseline is linked to this JIRA yet. Add it from Scenario Baselines → Add Test Baseline → Related JIRAs.</div>
+            </div>
+        `;
+    }
+
+    const lines = items.map(item => {
+        const release = `${item.release_name || "Release"} ${item.release_version ? `V${item.release_version}` : ""}`.trim();
+        return `
+            <div class="jira-history-line">
+                <strong>${escapeHtml(item.scenario_code || "")}</strong>
+                <span>→</span>
+                <span>${escapeHtml(release)}</span>
+                <span>→</span>
+                <span>${escapeHtml(item.testing_baseline_name || "Testing baseline")}</span>
+                <span>→</span>
+                <strong>${escapeHtml(item.status || "NOT_RUN")}</strong>
+            </div>
+        `;
+    }).join("");
+
+    return `
+        <div class="jira-history-text-board">
+            <h3>JIRA: ${escapeHtml(jiraId)}</h3>
+            <div class="muted-text">${Number(data.scenario_count || 0)} scenario(s), ${Number(data.covered_count || items.length)} baseline coverage item(s)</div>
+            <h4>Covered Baselines</h4>
+            <div class="jira-history-lines">${lines}</div>
+        </div>
+    `;
 }
 
 

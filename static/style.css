@@ -1735,3 +1735,48 @@ body {
 .version-test-row { margin-top:10px; padding:12px; border:1px solid #dce4ef; border-radius:10px; background:#fff; }
 .release-compare-card { margin-top:18px; }
 .release-compare-card .scenario-create-grid { margin:12px 0; }
+
+.jira-history-toolbar {
+    display: grid;
+    grid-template-columns: auto minmax(260px, 1fr) auto;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 14px;
+}
+
+.jira-history-toolbar select {
+    width: 100%;
+}
+
+.jira-history-text-board {
+    display: grid;
+    gap: 10px;
+}
+
+.jira-history-text-board h3,
+.jira-history-text-board h4 {
+    margin: 0;
+}
+
+.jira-history-lines {
+    display: grid;
+    gap: 8px;
+}
+
+.jira-history-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 12px;
+    border: 1px solid #dbe4ef;
+    border-radius: 10px;
+    background: #f8fafc;
+    overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+    .jira-history-toolbar {
+        grid-template-columns: 1fr;
+    }
+}
