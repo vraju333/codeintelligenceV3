@@ -104,7 +104,7 @@ class AttributeImpactService:
             (item["http_method"], item["endpoint"])
             for item in endpoints
         }
-        active_scenarios = self.scenarios.get_all_for_active_project(db)
+        active_scenarios = self.scenarios.get_all_for_attribute_impact(db)
         domain_tokens = self._infer_attribute_domain_tokens(occurrences, active_scenarios)
 
         scenarios = []
@@ -121,7 +121,8 @@ class AttributeImpactService:
 
             matched = sorted(involved.intersection(impacted_classes))
             endpoint_match = key in endpoint_keys
-            if not endpoint_match and not matched:
+            text_match = self._scenario_text_matches(scenario, attribute_name, impacted_classes)
+            if not endpoint_match and not matched and not text_match:
                 continue
             reasons = []
             score = 0
@@ -131,6 +132,11 @@ class AttributeImpactService:
             if matched:
                 score += 5
                 reasons.append("Scenario includes attribute-related classes: " + ", ".join(matched[:6]))
+            if endpoint_match and not matched and not involved:
+                reasons.append("Legacy scenario has no stored class dependencies; matched by affected endpoint")
+            if text_match:
+                score += 4
+                reasons.append("Scenario text mentions the attribute or related class")
             scenarios.append({
                 "id": scenario.id,
                 "scenario_code": scenario.scenario_code,
@@ -250,6 +256,21 @@ class AttributeImpactService:
             }
             for release_name, items in releases.items()
         ]
+
+    def _scenario_text_matches(self, scenario, attribute_name: str, impacted_classes: set[str]) -> bool:
+        haystack = " ".join(str(value or "") for value in (
+            scenario.scenario_code,
+            scenario.scenario_name,
+            scenario.description,
+            scenario.request_json,
+            scenario.expected_response_json,
+            scenario.expected_db_effect,
+        )).lower()
+        if not haystack:
+            return False
+        needles = {attribute_name.lower()}
+        needles.update(item.lower() for item in impacted_classes if item)
+        return any(needle and needle in haystack for needle in needles)
 
     def _extract_methods(self, flow: dict) -> list[str]:
         methods = []

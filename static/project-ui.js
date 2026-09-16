@@ -377,6 +377,11 @@ async function loadScenarios(page = scenarioPage) {
                                 <span class="scenario-test-data-icon" aria-hidden="true">&lt;/&gt;</span>
                                 <span class="scenario-test-data-text">Test Data</span>
                             </button>
+                            <button class="scenario-test-data-button"
+                                    type="button"
+                                    onclick="openScenarioEditPrompt('${escapeJsString(String(scenario.id || ""))}')">
+                                Edit
+                            </button>
                         </div>
                     </div>
                     <div class="scenario-test-data-panel"
@@ -391,6 +396,83 @@ async function loadScenarios(page = scenarioPage) {
         container.innerHTML = typeof renderError === "function" ? renderError(error.message) : escapeHtml(error.message);
         if (pager) pager.innerHTML = "";
     }
+}
+
+let scenarioEditModeId = null;
+
+function setScenarioModalText(title, subtitle, operationTitle, operationHelp, buttonText) {
+    const modal = document.getElementById("newScenarioModal");
+    const heading = modal?.querySelector(".flowchart-modal-header h2");
+    const subheading = modal?.querySelector(".flowchart-modal-header p");
+    const sectionTitle = modal?.querySelector(".scenario-create-section-title");
+    const help = modal?.querySelector(".scenario-create-help");
+    const button = document.getElementById("registerScenarioButton");
+    if (heading) heading.textContent = title;
+    if (subheading) subheading.textContent = subtitle;
+    if (sectionTitle) sectionTitle.textContent = operationTitle;
+    if (help) help.textContent = operationHelp;
+    if (button) button.textContent = buttonText;
+}
+
+async function openScenarioEditPrompt(scenarioId) {
+    const scenario = Array.from(scenarioRegistryScenarioMap.values())
+        .find(item => String(item.id || "") === String(scenarioId || ""));
+    if (!scenario) {
+        alert("Scenario is not available on this page.");
+        return;
+    }
+
+    scenarioEditModeId = scenarioId;
+    setScenarioModalText(
+        "Edit Scenario",
+        "Update scenario details and saved test data without changing its baselines.",
+        "Scenario operation",
+        "The operation is kept with the scenario so existing baselines and comparisons remain linked.",
+        "Save Scenario"
+    );
+
+    const modal = document.getElementById("newScenarioModal");
+    const details = document.getElementById("newScenarioDetails");
+    const status = document.getElementById("existingOperationScenario");
+    const button = document.getElementById("registerScenarioButton");
+    const methodSelect = document.getElementById("newScenarioMethod");
+    const endpointSelect = document.getElementById("newScenarioEndpoint");
+    const error = document.getElementById("newScenarioError");
+
+    if (methodSelect) {
+        methodSelect.innerHTML = `<option value="${escapeHtml(scenario.http_method || "")}">${escapeHtml(scenario.http_method || "")}</option>`;
+        methodSelect.disabled = true;
+    }
+    if (endpointSelect) {
+        endpointSelect.innerHTML = `<option value="${escapeHtml(scenario.endpoint || "")}">${escapeHtml(scenario.endpoint || "")}</option>`;
+        endpointSelect.disabled = true;
+    }
+    if (status) {
+        status.className = "scenario-operation-check available";
+        status.innerHTML = `<strong>${escapeHtml(scenario.http_method || "")} ${escapeHtml(scenario.endpoint || "")}</strong> is linked to this scenario.`;
+    }
+    if (details) details.classList.remove("hidden");
+    if (error) error.textContent = "";
+    if (button) button.disabled = false;
+
+    const values = {
+        newScenarioCode: scenario.scenario_code || "",
+        newScenarioName: scenario.scenario_name || "",
+        newScenarioJiraId: scenario.jira_id || "",
+        newScenarioDescription: scenario.description || "",
+        newScenarioRequestJson: scenario.request_json || "",
+        newScenarioExpectedResponse: scenario.expected_response_json || "",
+        newScenarioExpectedDbEffect: scenario.expected_db_effect || ""
+    };
+    for (const [id, value] of Object.entries(values)) {
+        const element = document.getElementById(id);
+        if (element) element.value = value;
+    }
+    const codeInput = document.getElementById("newScenarioCode");
+    if (codeInput) codeInput.disabled = true;
+
+    modal?.classList.add("open");
+    modal?.setAttribute("aria-hidden", "false");
 }
 
 
@@ -757,12 +839,27 @@ function scenarioOperationKey(method, endpoint) {
 async function openNewScenarioModal() {
     const modal = document.getElementById("newScenarioModal");
     if (!modal) return;
+    scenarioEditModeId = null;
+    setScenarioModalText(
+        "Register New Scenario",
+        "Create a scenario from an endpoint discovered in the selected Python project.",
+        "Choose an uncaptured operation",
+        "Only operations that do not already have a registered scenario are shown here.",
+        "Register Scenario"
+    );
 
     ["newScenarioCode", "newScenarioName", "newScenarioJiraId", "newScenarioDescription",
      "newScenarioRequestJson", "newScenarioExpectedResponse", "newScenarioExpectedDbEffect"].forEach(id => {
         const element = document.getElementById(id);
-        if (element) element.value = "";
+        if (element) {
+            element.value = "";
+            element.disabled = false;
+        }
     });
+    const methodSelect = document.getElementById("newScenarioMethod");
+    const endpointSelect = document.getElementById("newScenarioEndpoint");
+    if (methodSelect) methodSelect.disabled = false;
+    if (endpointSelect) endpointSelect.disabled = false;
 
     const error = document.getElementById("newScenarioError");
     if (error) error.textContent = "";
@@ -784,6 +881,7 @@ function closeNewScenarioModal() {
     if (!modal) return;
     modal.classList.remove("open");
     modal.setAttribute("aria-hidden", "true");
+    scenarioEditModeId = null;
 }
 
 async function loadAvailableScenarioOperations() {
@@ -1049,23 +1147,35 @@ async function registerNewScenario() {
         }
     }
 
-    if (button) { button.disabled = true; button.textContent = "Registering..."; }
+    const editingScenarioId = scenarioEditModeId;
+    if (button) { button.disabled = true; button.textContent = editingScenarioId ? "Saving..." : "Registering..."; }
     try {
-        const response = await fetch("/api/scenarios", {
-            method: "POST",
+        const payload = editingScenarioId ? {
+            scenario_name: name,
+            description: description || null,
+            jira_id: jiraId || null,
+            request_json: requestJson || null,
+            expected_response_json: expectedResponseJson || null,
+            expected_db_effect: expectedDbEffect || null,
+            status: "ACTIVE"
+        } : {
+            scenario_code: code,
+            scenario_name: name,
+            http_method: method,
+            endpoint: endpoint,
+            description: description || null,
+            jira_id: jiraId || null,
+            request_json: requestJson || null,
+            expected_response_json: expectedResponseJson || null,
+            expected_db_effect: expectedDbEffect || null,
+            status: "ACTIVE"
+        };
+        const response = await fetch(
+            editingScenarioId ? `/api/scenarios/${encodeURIComponent(editingScenarioId)}` : "/api/scenarios",
+            {
+            method: editingScenarioId ? "PATCH" : "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({
-                scenario_code: code,
-                scenario_name: name,
-                http_method: method,
-                endpoint: endpoint,
-                description: description || null,
-                jira_id: jiraId || null,
-                request_json: requestJson || null,
-                expected_response_json: expectedResponseJson || null,
-                expected_db_effect: expectedDbEffect || null,
-                status: "ACTIVE"
-            })
+            body: JSON.stringify(payload)
         });
         const responseText = await response.text();
         let data = {};
@@ -1075,12 +1185,12 @@ async function registerNewScenario() {
             data = {detail: responseText || `HTTP ${response.status}`};
         }
         if (!response.ok) {
-            throw new Error((typeof data.detail === "object" ? data.detail.message : data.detail) || `Scenario registration failed (HTTP ${response.status})`);
+            throw new Error((typeof data.detail === "object" ? data.detail.message : data.detail) || `Scenario ${editingScenarioId ? "update" : "registration"} failed (HTTP ${response.status})`);
         }
 
         closeNewScenarioModal();
-        scenarioPage = 1;
-        await loadScenarios(1);
+        if (!editingScenarioId) scenarioPage = 1;
+        await loadScenarios(scenarioPage);
 
         // Defect Investigation is scenario-driven. Refresh its dropdown
         // immediately so a newly registered scenario is selectable without
@@ -1091,9 +1201,9 @@ async function registerNewScenario() {
 
         if (typeof loadBaselineOverview === "function") await loadBaselineOverview();
     } catch (e) {
-        if (error) error.textContent = e.message || "Could not register scenario.";
+        if (error) error.textContent = e.message || `Could not ${editingScenarioId ? "save" : "register"} scenario.`;
     } finally {
-        if (button) { button.disabled = false; button.textContent = "Register Scenario"; }
+        if (button) { button.disabled = false; button.textContent = editingScenarioId ? "Save Scenario" : "Register Scenario"; }
     }
 }
 

@@ -2,7 +2,7 @@ from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from db_models import Scenario
-from schemas import ScenarioRequest
+from schemas import ScenarioRequest, ScenarioUpdateRequest
 
 
 class ScenarioRepository:
@@ -17,6 +17,14 @@ class ScenarioRepository:
 
     def find_all(self, db: Session, project_path: str | None = None):
         query = self._project_filter(db.query(Scenario), project_path)
+        return query.order_by(Scenario.id).all()
+
+    def find_all_for_project_or_legacy(self, db: Session, project_path: str | None = None):
+        query = db.query(Scenario)
+        if project_path:
+            query = query.filter(or_(Scenario.project_path == project_path, Scenario.project_path.is_(None)))
+        else:
+            query = query.filter(Scenario.project_path.is_(None))
         return query.order_by(Scenario.id).all()
 
     def find_page_for_endpoints(
@@ -110,6 +118,15 @@ class ScenarioRepository:
         data["project_path"] = project_path
         scenario = Scenario(**data)
         db.add(scenario)
+        db.commit()
+        db.refresh(scenario)
+        return scenario
+
+    def update(self, db: Session, scenario: Scenario, request: ScenarioUpdateRequest):
+        data = request.model_dump(exclude_unset=True)
+        for field, value in data.items():
+            if hasattr(scenario, field):
+                setattr(scenario, field, value)
         db.commit()
         db.refresh(scenario)
         return scenario
