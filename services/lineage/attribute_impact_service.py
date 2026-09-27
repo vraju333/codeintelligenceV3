@@ -9,6 +9,7 @@ from services.flow.endpoint_flow_service import EndpointFlowService
 from services.lineage.attribute_lineage_service import AttributeLineageService
 from services.scenario.scenario_service import ScenarioService
 from repositories.scenario_baseline_repository import ScenarioBaselineRepository
+from db_models import JiraKnowledge
 
 
 class AttributeImpactService:
@@ -82,6 +83,10 @@ class AttributeImpactService:
                 "matched_classes": matched_classes,
                 "matched_methods": matched_methods,
                 "flow_methods": flow_methods,
+                "branch_evidence": self._extract_attribute_branches(
+                    flow=flow,
+                    attribute_name=attribute_name,
+                ),
                 "dependency_path": self._build_path(
                     attribute_name=attribute_name,
                     flow_methods=flow_methods,
@@ -104,7 +109,7 @@ class AttributeImpactService:
             (item["http_method"], item["endpoint"])
             for item in endpoints
         }
-        active_scenarios = self.scenarios.get_all_for_attribute_impact(db)
+        active_scenarios = self.scenarios.get_all(db)
         domain_tokens = self._infer_attribute_domain_tokens(occurrences, active_scenarios)
 
         scenarios = []
@@ -146,7 +151,12 @@ class AttributeImpactService:
                 "score": score,
                 "matched_classes": matched,
                 "reasons": reasons,
-                "release_history": self._release_history_for_scenario(db, scenario.id),
+                "release_history": self._release_history_for_scenario(
+                    db,
+                    scenario.id,
+                    attribute_name=attribute_name,
+                    domain_tokens=domain_tokens,
+                ),
             })
 
         scenarios.sort(key=lambda item: (-item["score"], item["scenario_code"]))
@@ -192,6 +202,47 @@ class AttributeImpactService:
             else "LOW"
         )
 
+        historical_traceability = []
+        for scenario in scenarios:
+            for release in scenario.get("release_history") or []:
+                for version in release.get("versions") or []:
+                    tests = version.get("tests") or []
+                    if tests:
+                        for test in tests:
+                            historical_traceability.append({
+                                "attribute": attribute_name,
+                                "scenario_id": scenario.get("id"),
+                                "scenario_code": scenario.get("scenario_code"),
+                                "http_method": scenario.get("http_method"),
+                                "endpoint": scenario.get("endpoint"),
+                                "test_baseline": test.get("test_scenario"),
+                                "test_status": test.get("status"),
+                                "jira_ids": test.get("jira_ids") or [],
+                                "jiras": test.get("jiras") or [],
+                                "release": release.get("release"),
+                                "release_version": version.get("release_version"),
+                                "code_baseline_version": version.get("internal_version"),
+                                "is_active": version.get("is_active"),
+                                "created_at": test.get("created_at") or version.get("created_at"),
+                            })
+                    else:
+                        historical_traceability.append({
+                            "attribute": attribute_name,
+                            "scenario_id": scenario.get("id"),
+                            "scenario_code": scenario.get("scenario_code"),
+                            "http_method": scenario.get("http_method"),
+                            "endpoint": scenario.get("endpoint"),
+                            "test_baseline": None,
+                            "test_status": None,
+                            "jira_ids": [],
+                            "jiras": [],
+                            "release": release.get("release"),
+                            "release_version": version.get("release_version"),
+                            "code_baseline_version": version.get("internal_version"),
+                            "is_active": version.get("is_active"),
+                            "created_at": version.get("created_at"),
+                        })
+
         return {
             "status": "ANALYSIS_COMPLETE",
             "attribute": attribute_name,
@@ -202,6 +253,7 @@ class AttributeImpactService:
             "occurrences": occurrences,
             "affected_endpoints": endpoints[:20],
             "affected_scenarios": scenarios[:30],
+            "historical_traceability": historical_traceability[:100],
             "domain_filter": {
                 "mode": "DOMAIN_ONLY" if domain_tokens else "SHARED_OR_UNKNOWN",
                 "tokens": sorted(domain_tokens),
@@ -217,11 +269,24 @@ class AttributeImpactService:
             },
         }
 
-    def _release_history_for_scenario(self, db: Session, scenario_id: int) -> list[dict]:
-        """Exact scenario-scoped Release → Version → Test → JIRA history."""
+    def _release_history_for_scenario(
+        self,
+        db: Session,
+        scenario_id: int,
+        attribute_name: str = "",
+        domain_tokens: set[str] | None = None,
+    ) -> list[dict]:
         versions = self.baselines.find_all_for_scenario(db, scenario_id)
         if not versions:
             return []
+
+        domain_tokens = {str(x).lower() for x in (domain_tokens or set()) if x}
+        jira_rows = db.query(JiraKnowledge).all()
+        jira_map = {
+            str(row.jira_id or "").strip().upper(): row
+            for row in jira_rows
+            if str(row.jira_id or "").strip()
+        }
 
         releases: dict[str, list[dict]] = {}
         for baseline in sorted(versions, key=lambda item: int(item.baseline_version or 0)):
@@ -230,7 +295,18 @@ class AttributeImpactService:
             tests = self.baselines.find_test_baselines_for_code_version(
                 db, scenario_id, int(baseline.baseline_version)
             )
-            version_item = {
+
+            relevant_tests = [
+                test for test in tests
+                if self._test_baseline_matches_attribute(
+                    test=test,
+                    attribute_name=attribute_name,
+                    domain_tokens=domain_tokens,
+                    jira_map=jira_map,
+                )
+            ]
+
+            releases.setdefault(release_name, []).append({
                 "baseline_id": baseline.id,
                 "internal_version": int(baseline.baseline_version or 0),
                 "release_version": release_version,
@@ -242,19 +318,87 @@ class AttributeImpactService:
                         "test_scenario": test.baseline_name,
                         "status": test.status,
                         "jira_ids": list(test.jira_ids or []),
+                        "jiras": [
+                            {
+                                "jira_id": jira_id,
+                                "title": getattr(jira_map.get(str(jira_id).upper()), "title", None),
+                                "requirement": getattr(jira_map.get(str(jira_id).upper()), "requirement", None),
+                            }
+                            for jira_id in (test.jira_ids or [])
+                        ],
                         "created_at": test.created_at.isoformat() if test.created_at else None,
                     }
-                    for test in tests
+                    for test in relevant_tests
                 ],
-            }
-            releases.setdefault(release_name, []).append(version_item)
+            })
 
         return [
-            {
-                "release": release_name,
-                "versions": sorted(items, key=lambda item: item["release_version"]),
-            }
+            {"release": release_name, "versions": sorted(items, key=lambda item: item["release_version"])}
             for release_name, items in releases.items()
+            if any(item.get("tests") for item in items)
+        ]
+
+    def _test_baseline_matches_attribute(
+        self,
+        test,
+        attribute_name: str,
+        domain_tokens: set[str],
+        jira_map: dict,
+    ) -> bool:
+        """Keep only test baselines that can legitimately trace to the attribute.
+
+        Domain-owned attributes (for example Student.gpa) must stay in that
+        domain. Shared attributes can span domains, but still need concrete
+        attribute/JIRA evidence where available.
+        """
+        test_name = str(getattr(test, "baseline_name", "") or "")
+        test_tokens = set(self._tokenize_name(test_name))
+
+        if domain_tokens and not (domain_tokens & test_tokens):
+            return False
+
+        jira_ids = list(getattr(test, "jira_ids", None) or [])
+        jira_text = " ".join(
+            " ".join([
+                str(getattr(jira_map.get(str(jira_id).upper()), "title", "") or ""),
+                str(getattr(jira_map.get(str(jira_id).upper()), "requirement", "") or ""),
+            ])
+            for jira_id in jira_ids
+        )
+
+        evidence_text = " ".join([
+            test_name,
+            str(getattr(test, "request_json", "") or ""),
+            str(getattr(test, "expected_response_json", "") or ""),
+            str(getattr(test, "actual_response_json", "") or ""),
+            str(getattr(test, "expected_db_effect", "") or ""),
+            jira_text,
+        ])
+
+        attribute_tokens = set(self._tokenize_name(attribute_name))
+        evidence_tokens = set(self._tokenize_name(evidence_text))
+
+        if attribute_tokens and attribute_tokens & evidence_tokens:
+            return True
+
+        # For an exclusive domain attribute, the code lineage has already proven
+        # the attribute belongs to that domain. A domain-specific test baseline
+        # on the affected operation is therefore valid historical traceability.
+        if domain_tokens and domain_tokens & test_tokens:
+            return True
+
+        # Shared attributes need concrete test/JIRA evidence; otherwise showing
+        # every sibling test under the operation would overstate traceability.
+        return False
+
+    @staticmethod
+    def _tokenize_name(value: str) -> list[str]:
+        text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", str(value or ""))
+        text = text.replace("_", " ").replace("-", " ")
+        return [
+            token.lower()
+            for token in re.findall(r"[A-Za-z0-9]+", text)
+            if len(token) >= 2
         ]
 
     def _scenario_text_matches(self, scenario, attribute_name: str, impacted_classes: set[str]) -> bool:
@@ -300,6 +444,55 @@ class AttributeImpactService:
         walk(flow.get("simplified_flow"))
         walk(flow.get("flow"))
         return methods
+
+    def _extract_attribute_branches(self, flow: dict, attribute_name: str) -> list[dict]:
+        """Return branch conditions in the endpoint flow that use the attribute."""
+        target_tokens = set(self._tokenize_name(attribute_name))
+        target_compact = re.sub(r"[^a-z0-9]", "", str(attribute_name or "").lower())
+        evidence, seen = [], set()
+
+        def matches(branch):
+            for value in branch.get("attributes") or []:
+                value_tokens = set(self._tokenize_name(str(value)))
+                value_compact = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+                if target_tokens & value_tokens:
+                    return True
+                if target_compact and value_compact and (
+                    target_compact == value_compact
+                    or target_compact in value_compact
+                    or value_compact in target_compact
+                ):
+                    return True
+            condition_tokens = set(self._tokenize_name(str(branch.get("condition") or "")))
+            return bool(target_tokens & condition_tokens)
+
+        def walk(value, owner=None, method=None):
+            if isinstance(value, dict):
+                owner = value.get("class_name") or owner
+                method = value.get("method_name") or method
+                for branch in value.get("branches") or []:
+                    if isinstance(branch, dict) and matches(branch):
+                        item = {
+                            "branch_type": branch.get("branch_type"),
+                            "condition": branch.get("condition"),
+                            "attributes": branch.get("attributes") or [],
+                            "calls": branch.get("calls") or [],
+                            "class_name": owner,
+                            "method_name": method,
+                        }
+                        key = (item["branch_type"], item["condition"], owner, method)
+                        if key not in seen:
+                            seen.add(key)
+                            evidence.append(item)
+                for key, child in value.items():
+                    if key != "branches":
+                        walk(child, owner, method)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child, owner, method)
+
+        walk(flow.get("flow") if isinstance(flow, dict) else flow)
+        return evidence
 
     def _build_path(
         self,

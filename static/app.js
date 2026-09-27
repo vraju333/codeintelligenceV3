@@ -1278,12 +1278,10 @@ async function openMainBaselineModal(scenarioId) {
     mainBaselineCreateMode = "release";
     document.querySelector("#mainBaselineModal h2").textContent = "Add Baseline";
     document.getElementById("mainBaselineOperation").textContent =
-        `${item.http_method} ${item.endpoint} · ${item.scenario_code} · Release → Version`;
+        `${item.http_method} ${item.endpoint} · ${item.scenario_code} · Month/Year → Version`;
     const error = document.getElementById("mainBaselineError");
     if (error) error.textContent = "";
 
-    // Open immediately. Loading history should never make the button appear broken
-    // when the API is slow or temporarily unavailable.
     modal.classList.add("open");
     modal.setAttribute("aria-hidden", "false");
 
@@ -1296,70 +1294,43 @@ async function openMainBaselineModal(scenarioId) {
         mainBaselineHistoryItems = [];
     }
 
-    const groups = groupBaselineReleases(mainBaselineHistoryItems);
-    const releaseSelect = document.getElementById("mainBaselineReleaseSelect");
-    if (releaseSelect) {
-        const existing = [...groups.keys()];
-        releaseSelect.innerHTML = existing.map(name =>
-            `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`
-        ).join("") + `<option value="__new__">+ New Release</option>`;
-        releaseSelect.value = item.baseline_captured && item.active_baseline_name && groups.has(item.active_baseline_name)
-            ? item.active_baseline_name : "__new__";
+    const now = new Date();
+    const monthSelect = document.getElementById("mainBaselineMonth");
+    const yearSelect = document.getElementById("mainBaselineYear");
+    if (monthSelect) {
+        monthSelect.value = now.toLocaleString("en-US", {month: "long"});
     }
-    const name = document.getElementById("mainBaselineName");
-    if (name) name.value = "";
-    onMainBaselineReleaseChanged();
+    if (yearSelect) {
+        const currentYear = now.getFullYear();
+        yearSelect.innerHTML = Array.from({length: 7}, (_, i) => currentYear - 2 + i)
+            .map(year => `<option value="${year}">${year}</option>`).join("");
+        yearSelect.value = String(currentYear);
+    }
+    updateMainBaselineVersionPreview();
 }
 
-function onMainBaselineReleaseChanged() {
-    const select = document.getElementById("mainBaselineReleaseSelect");
-    const wrap = document.getElementById("mainBaselineNameWrap");
-    const name = document.getElementById("mainBaselineName");
-    const isNew = !select || select.value === "__new__";
-    if (wrap) wrap.style.display = isNew ? "" : "none";
-    if (name && !isNew) name.value = select.value;
-    updateMainBaselineVersionPreview();
-    if (isNew) setTimeout(() => name?.focus(), 0);
+function selectedMainBaselineReleaseName() {
+    const month = (document.getElementById("mainBaselineMonth")?.value || "").trim();
+    const year = (document.getElementById("mainBaselineYear")?.value || "").trim();
+    return month && year ? `${month} ${year}` : "";
 }
 
 function updateMainBaselineVersionPreview() {
-    const select = document.getElementById("mainBaselineReleaseSelect");
-    const name = document.getElementById("mainBaselineName");
+    const releaseName = selectedMainBaselineReleaseName();
     const display = document.getElementById("mainBaselineVersionDisplay");
-    const releaseName = select?.value === "__new__" ? (name?.value || "").trim() : (select?.value || "");
     const groups = groupBaselineReleases(mainBaselineHistoryItems);
     const versions = groups.get(releaseName) || [];
     const next = versions.length ? Math.max(...versions.map(releaseDisplayVersion)) + 1 : 1;
     if (display) display.value = `V${next}`;
     const button = document.getElementById("saveMainBaselineButton");
-    if (button) button.textContent = `Create ${releaseName || "Release"} V${next}`;
+    if (button) button.textContent = releaseName ? `Create ${releaseName} · V${next}` : `Create Baseline V${next}`;
 }
 
-function openNewMainBaselineModalFromHistory() {
+async function openNewMainBaselineModalFromHistory() {
     const scenarioId = activeTestingBaselineHistoryScenarioId;
-    const item = baselineOverviewData.find(x => Number(x.scenario_id) === Number(scenarioId));
-    const modal = document.getElementById("mainBaselineModal");
-    if (!item || !modal || !item.baseline_captured) return;
-
-    mainBaselineCreateMode = "next";
-    activeMainBaselineScenarioId = Number(scenarioId);
-    document.querySelector("#mainBaselineModal h2").textContent = "New Baseline";
-    document.getElementById("mainBaselineOperation").textContent =
-        `Current: ${item.active_baseline_name || "Main Baseline"} · V${item.active_baseline_version} → New: V${Number(item.active_baseline_version || 0) + 1}`;
-    const saveButton = document.getElementById("saveMainBaselineButton");
-    if (saveButton) saveButton.textContent = `Create V${Number(item.active_baseline_version || 0) + 1}`;
-    const name = document.getElementById("mainBaselineName");
-    const error = document.getElementById("mainBaselineError");
-    if (name) {
-        name.value = "";
-        name.placeholder = "e.g. November 2026";
-    }
-    if (error) error.textContent = "";
-
+    if (!scenarioId) return;
     closeTestingBaselineHistoryModal(false);
-    modal.classList.add("open");
-    modal.setAttribute("aria-hidden", "false");
-    setTimeout(() => name?.focus(), 0);
+    await openMainBaselineModal(scenarioId);
 }
 
 function closeMainBaselineModal() {
@@ -1378,11 +1349,8 @@ async function saveMainBaseline() {
     if (!scenarioId) return;
     if (error) error.textContent = "";
     try {
-        const releaseSelect = document.getElementById("mainBaselineReleaseSelect");
-        const releaseName = releaseSelect?.value === "__new__"
-            ? (document.getElementById("mainBaselineName")?.value || "").trim()
-            : (releaseSelect?.value || "").trim();
-        if (!releaseName) throw new Error("Release name is required, for example October.");
+        const releaseName = selectedMainBaselineReleaseName();
+        if (!releaseName) throw new Error("Month and year are required.");
         const item = baselineOverviewData.find(x => Number(x.scenario_id) === Number(scenarioId));
         if (!item) throw new Error("Scenario overview is not loaded.");
 
@@ -1423,6 +1391,7 @@ async function saveMainBaseline() {
 let activeTestingBaselineScenarioId = null;
 let testingBaselineJiraIds = [];
 let testingBaselineVersionItems = [];
+let editingTestingBaselineId = null;
 
 function ensureTestingBaselineSelectors() {
     const modal = document.getElementById("testingBaselineModal");
@@ -1536,6 +1505,15 @@ function removeTestingBaselineJira(index) {
 
 
 async function openTestingBaselineModal(scenarioId) {
+    editingTestingBaselineId = null;
+    const editTitle = document.querySelector("#testingBaselineModal h2");
+    if (editTitle) editTitle.textContent = "Add Testing Baseline";
+    const editSaveButton = document.getElementById("saveTestingBaselineButton");
+    if (editSaveButton) editSaveButton.textContent = "Save Testing Baseline";
+    const editReleaseSelect = document.getElementById("testingBaselineReleaseSelect");
+    const editVersionSelect = document.getElementById("testingBaselineVersionSelect");
+    if (editReleaseSelect) editReleaseSelect.disabled = false;
+    if (editVersionSelect) editVersionSelect.disabled = false;
     const modal = document.getElementById("testingBaselineModal");
     const item = baselineOverviewData.find(x => Number(x.scenario_id) === Number(scenarioId));
     if (!modal || !item) return;
@@ -1650,6 +1628,7 @@ function closeTestingBaselineModal() {
     activeTestingBaselineScenarioId = null;
     testingBaselineJiraIds = [];
     testingBaselineVersionItems = [];
+    editingTestingBaselineId = null;
     renderTestingBaselineJiras();
 }
 
@@ -1708,11 +1687,15 @@ async function saveTestingBaseline() {
         };
 
         if (button) { button.disabled = true; button.textContent = "Saving..."; }
-        const response = await fetch(`/api/scenario-baselines/testing/${scenarioId}`, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify(body)
-        });
+        const editId = editingTestingBaselineId;
+        const response = await fetch(
+            editId ? `/api/scenario-baselines/testing/${scenarioId}/${editId}` : `/api/scenario-baselines/testing/${scenarioId}`,
+            {
+                method: editId ? "PUT" : "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(body)
+            }
+        );
         const data = await response.json();
         if (!response.ok) {
             const detail = data?.detail;
@@ -1818,7 +1801,82 @@ function renderSelectedTestingBaseline() {
         <div class="testing-history-field">
             <div class="testing-history-label">Expected DB Effect</div>
             <pre>${escapeHtml(baseline.expected_db_effect || "Nothing")}</pre>
+        </div>
+        <div style="margin-top:12px;">
+            <button class="secondary-button" type="button" onclick="editSelectedTestingBaseline()">✏ Edit Test Baseline</button>
         </div>`;
+}
+
+async function editSelectedTestingBaseline() {
+    const baseline = testingBaselineHistoryItems[Number(document.getElementById("testingBaselineHistorySelect")?.value)];
+    const scenarioId = activeTestingBaselineHistoryScenarioId;
+    if (!baseline || !scenarioId) return;
+
+    closeTestingBaselineHistoryModal(false);
+    await openTestingBaselineModal(scenarioId);
+    editingTestingBaselineId = Number(baseline.id);
+
+    const title = document.querySelector("#testingBaselineModal h2");
+    if (title) title.textContent = "Edit Testing Baseline";
+    const button = document.getElementById("saveTestingBaselineButton");
+    if (button) button.textContent = "Save Changes";
+
+    document.getElementById("testingBaselineName").value = baseline.baseline_name || "";
+    document.getElementById("testingBaselineRequest").value = prettyScenarioJson(baseline.request_json);
+    document.getElementById("testingBaselineExpected").value = prettyScenarioJson(baseline.expected_response_json);
+    document.getElementById("testingBaselineActual").value = prettyScenarioJson(baseline.actual_response_json);
+    document.getElementById("testingBaselineDbEffect").value = baseline.expected_db_effect || "";
+    testingBaselineJiraIds = Array.isArray(baseline.jira_ids) ? [...baseline.jira_ids] : [];
+    renderTestingBaselineJiras();
+}
+
+
+
+async function editTestingBaselineFromRelease(scenarioId, testBaselineId) {
+    try {
+        const response = await fetch(`/api/scenario-baselines/testing/${scenarioId}`);
+        const items = await response.json();
+        if (!response.ok) throw new Error(JSON.stringify(items));
+        const baseline = (Array.isArray(items) ? items : []).find(x => Number(x.id) === Number(testBaselineId));
+        if (!baseline) throw new Error("Test Baseline not found.");
+
+        await openTestingBaselineModal(scenarioId);
+        editingTestingBaselineId = Number(baseline.id);
+
+        const title = document.querySelector("#testingBaselineModal h2");
+        if (title) title.textContent = "Edit Testing Baseline";
+        const button = document.getElementById("saveTestingBaselineButton");
+        if (button) button.textContent = "Save Changes";
+
+        document.getElementById("testingBaselineName").value = baseline.baseline_name || "";
+        document.getElementById("testingBaselineRequest").value = prettyScenarioJson(baseline.request_json);
+        document.getElementById("testingBaselineExpected").value = prettyScenarioJson(baseline.expected_response_json);
+        document.getElementById("testingBaselineActual").value = prettyScenarioJson(baseline.actual_response_json);
+        document.getElementById("testingBaselineDbEffect").value = baseline.expected_db_effect || "";
+        testingBaselineJiraIds = Array.isArray(baseline.jira_ids) ? [...baseline.jira_ids] : [];
+        renderTestingBaselineJiras();
+
+        const releaseSelect = document.getElementById("testingBaselineReleaseSelect");
+        const versionSelect = document.getElementById("testingBaselineVersionSelect");
+        const selectedVersion = testingBaselineVersionItems.find(x =>
+            Number(x.id) === Number(baseline.baseline_id) ||
+            Number(x.baseline_version) === Number(baseline.code_baseline_version)
+        );
+        if (selectedVersion) {
+            if (releaseSelect) {
+                releaseSelect.value = selectedVersion.baseline_name || "Legacy";
+                onTestingBaselineReleaseChanged();
+            }
+            if (versionSelect) {
+                versionSelect.value = String(selectedVersion.id);
+                onTestingBaselineVersionChanged();
+            }
+        }
+        if (releaseSelect) releaseSelect.disabled = true;
+        if (versionSelect) versionSelect.disabled = true;
+    } catch (error) {
+        alert(error.message || "Could not open Test Baseline for editing.");
+    }
 }
 
 
@@ -1838,31 +1896,73 @@ async function loadBaselineHistory() {
     }
     container.innerHTML = "Loading baseline history...";
     try {
-        const response = await fetch(`/api/scenario-baselines/history/${scenarioId}`);
-        const data = await response.json();
-        if (!response.ok) throw new Error(JSON.stringify(data));
+        const [historyResponse, archiveResponse] = await Promise.all([
+            fetch(`/api/scenario-baselines/history/${scenarioId}`),
+            fetch(`/api/scenario-baselines/archive-status/${scenarioId}`)
+        ]);
+        const data = await historyResponse.json();
+        const archiveStatus = archiveResponse.ok ? await archiveResponse.json() : {};
+        if (!historyResponse.ok) throw new Error(JSON.stringify(data));
         if (!Array.isArray(data) || data.length === 0) {
             container.innerHTML = `<div class="warning">No baseline has been captured for this scenario yet.</div>`;
             return;
         }
+
+        const label = b => `${escapeHtml(b.baseline_name || "Main Baseline")} · V${b.release_version || b.baseline_version || 1}`;
+        const archiveAction = b => {
+            const archived = archiveStatus[String(b.id)];
+            return archived
+                ? `<span class="tag">ARCHIVED</span><span class="muted-text">Audit ${escapeHtml(String(archived.snapshot_hash || "").slice(0, 12))}…</span>`
+                : `<button class="secondary-button" type="button" onclick="archiveBaselineRelease(${Number(scenarioId)}, ${Number(b.id)})">Archive Release</button>`;
+        };
+
         const active = data.find(item => item.is_active) || data[0];
         const previous = data.filter(item => item.id !== active.id);
         container.innerHTML = `
             <div class="active-baseline-card">
-                <div><span class="muted-text">Current baseline</span><h3>${escapeHtml(active.baseline_name || "Main Baseline")} · V${active.baseline_version}</h3></div>
+                <div><span class="muted-text">Current baseline</span><h3>${label(active)}</h3></div>
                 <span class="tag">ACTIVE</span>
                 <div class="baseline-detail">${escapeHtml(active.http_method)} ${escapeHtml(active.endpoint)}</div>
                 <div class="baseline-detail">Flow: ${active.endpoint_flow ? "stored" : "not stored"}</div>
+                <div class="baseline-detail">${archiveAction(active)}</div>
             </div>
             ${previous.length ? `
                 <details class="technical-details">
                     <summary>Previous versions (${previous.length})</summary>
-                    ${previous.map(b => `<div class="history-row"><strong>V${b.baseline_version}</strong><span>${escapeHtml(b.http_method)} ${escapeHtml(b.endpoint)}</span><span>Flow: ${b.endpoint_flow ? "stored" : "not stored"}</span></div>`).join("")}
-                </details>
-            ` : `<div class="muted-box">No previous versions.</div>`}
-        `;
+                    ${previous.map(b => `<div class="history-row"><strong>${label(b)}</strong><span>${escapeHtml(b.http_method)} ${escapeHtml(b.endpoint)}</span>${archiveAction(b)}</div>`).join("")}
+                </details>` : `<div class="muted-box">No previous versions.</div>`}
+            <div style="margin-top:12px;"><button class="secondary-button" type="button" onclick="viewReleaseArchives(${Number(scenarioId)})">View Release Archive</button></div>
+            <div id="releaseArchiveResult" style="margin-top:10px;"></div>`;
     } catch (error) {
         container.innerHTML = renderError(error.message);
+    }
+}
+
+async function archiveBaselineRelease(scenarioId, baselineId) {
+    if (!confirm("Archive this release/version? Archived releases become read-only.")) return;
+    try {
+        const response = await fetch(`/api/scenario-baselines/archive/${scenarioId}/${baselineId}`, {method: "POST"});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.detail || `HTTP ${response.status}`);
+        await loadBaselineHistory();
+    } catch (error) {
+        alert(error.message || "Could not archive release.");
+    }
+}
+
+async function viewReleaseArchives(scenarioId) {
+    const target = document.getElementById("releaseArchiveResult");
+    if (!target) return;
+    target.innerHTML = "Loading release archive...";
+    try {
+        const response = await fetch(`/api/scenario-baselines/archives/${scenarioId}`);
+        const items = await response.json();
+        if (!response.ok) throw new Error(JSON.stringify(items));
+        target.innerHTML = Array.isArray(items) && items.length
+            ? items.map(item => `<div class="history-row"><strong>${escapeHtml(item.baseline_name)} · V${item.release_version}</strong><span>Code V${item.code_baseline_version}</span><span>${item.archived_at ? escapeHtml(new Date(item.archived_at).toLocaleString()) : ""}</span><span class="muted-text">SHA-256 ${escapeHtml(String(item.snapshot_hash || "").slice(0, 16))}…</span></div>`).join("")
+            : `<div class="muted-box">No archived release versions yet.</div>`;
+    } catch (error) {
+        target.innerHTML = renderError(error.message);
     }
 }
 
@@ -1958,6 +2058,191 @@ function renderJiraCoverage(data) {
             <div class="muted-text">${Number(data.scenario_count || 0)} scenario(s), ${Number(data.covered_count || items.length)} baseline coverage item(s)</div>
             <h4>Covered Baselines</h4>
             <div class="jira-history-lines">${lines}</div>
+        </div>
+    `;
+}
+
+async function rebuildScenarioRagRegistry() {
+    const result = document.getElementById("scenarioRagRegistryResult");
+    if (!result) return;
+
+    result.innerHTML = "Rebuilding scenario registry index...";
+    try {
+        const response = await fetch("/api/scenario-rag-registry/index", {
+            method: "POST"
+        });
+        const data = await readJsonOrText(response);
+        if (!response.ok) throw new Error(typeof data === "string" ? data : JSON.stringify(data));
+
+        result.innerHTML = `
+            <div class="success">
+                Scenario registry indexed · ${Number(data.documents || 0)} document(s)
+            </div>
+            <div class="muted-box">
+                Indexed scenarios, release versions, test baselines, JIRAs and stored flow/test data for the selected project.
+            </div>
+        `;
+    } catch (error) {
+        result.innerHTML = renderError(error.message);
+    }
+}
+
+async function searchScenarioRagRegistry() {
+    const input = document.getElementById("scenarioRagQuery");
+    const result = document.getElementById("scenarioRagRegistryResult");
+    if (!input || !result) return;
+
+    const query = String(input.value || "").trim();
+    if (!query) {
+        result.innerHTML = `<div class="warning">Enter an attribute, JIRA, release, version or scenario to search.</div>`;
+        return;
+    }
+
+    result.innerHTML = "Searching scenario registry...";
+    try {
+        const response = await fetch(`/api/scenario-rag-registry/search?query=${encodeURIComponent(query)}&top_k=10`);
+        const data = await readJsonOrText(response);
+        if (!response.ok) throw new Error(typeof data === "string" ? data : JSON.stringify(data));
+
+        result.innerHTML = renderScenarioRagRegistryResults(data);
+    } catch (error) {
+        result.innerHTML = renderError(error.message);
+    }
+}
+
+async function readJsonOrText(response) {
+    const text = await response.text();
+    if (!text) return {};
+    try {
+        return JSON.parse(text);
+    } catch (_) {
+        return text;
+    }
+}
+
+function renderScenarioRagRegistryResults(data) {
+    const results = Array.isArray(data.results) ? data.results : [];
+    const query = data.query || "";
+
+    if (!results.length) {
+        return `
+            <div class="muted-box scenario-rag-empty">
+                No captured scenario/release evidence found for <strong>${escapeHtml(query)}</strong>.
+            </div>
+        `;
+    }
+
+    const understanding = data.llm_understanding || {};
+    const historical = data.historical_answer || {};
+    const historicalPanel = historical.is_historical_query ? `
+        <div class="muted-box scenario-rag-historical-answer" style="margin:12px 0;">
+            <strong>Historical Answer</strong>
+            <div style="margin-top:6px;">${escapeHtml(historical.message || "No captured historical evidence found.")}</div>
+            ${(Array.isArray(historical.timeline) && historical.timeline.length) ? `
+                <details style="margin-top:8px;">
+                    <summary>View historical trace</summary>
+                    <div style="margin-top:8px;">
+                        ${historical.timeline.map(row => `
+                            <div class="jira-history-line" style="margin-bottom:6px;flex-wrap:wrap;">
+                                <strong>${escapeHtml(row.release_name || "No release")}${row.release_version ? ` V${escapeHtml(row.release_version)}` : ""}</strong>
+                                ${row.test_baseline ? `<span>→</span><span>${escapeHtml(row.test_baseline)}</span>` : ""}
+                                ${row.test_status ? `<span>→</span><span>${escapeHtml(row.test_status)}</span>` : ""}
+                                ${(Array.isArray(row.jira_ids) && row.jira_ids.length)
+                                    ? `<span>→</span>${row.jira_ids.map(id => `<span class="testing-jira-chip">${escapeHtml(id)}</span>`).join("")}`
+                                    : ""}
+                            </div>
+                        `).join("")}
+                    </div>
+                </details>
+            ` : ""}
+        </div>
+    ` : "";
+    const llmPanel = understanding.enabled ? `
+        <div class="muted-box scenario-rag-understanding">
+            <strong>LLM query understanding:</strong>
+            ${understanding.used ? "Used" : "Fallback"}
+            ${(understanding.attributes || []).length ? ` · Attributes: ${(understanding.attributes || []).map(escapeHtml).join(", ")}` : ""}
+            ${(understanding.concepts || []).length ? ` · Concepts: ${(understanding.concepts || []).map(escapeHtml).join(", ")}` : ""}
+            ${understanding.reason ? ` · ${escapeHtml(understanding.reason)}` : ""}
+        </div>
+    ` : `
+        <div class="muted-box scenario-rag-understanding">
+            <strong>LLM query understanding:</strong> Not configured. Used local hybrid retrieval.
+        </div>
+    `;
+
+    const cards = results.map(item => {
+        const meta = item.metadata || {};
+        const isTest = meta.document_type === "test_baseline";
+        const title = isTest
+            ? (meta.relevant_test_baseline || meta.scenario_code || item.scenario_code || "")
+            : (meta.scenario_code || item.scenario_code || "");
+        const release = meta.release_name
+            ? `${meta.release_name}${meta.release_version ? ` V${meta.release_version}` : ""}`
+            : "No release captured";
+        const codeVersion = meta.code_baseline_version
+            ? `Code V${meta.code_baseline_version}`
+            : "No code version";
+        const jiras = Array.isArray(meta.jira_ids) ? meta.jira_ids : [];
+        const tests = Array.isArray(meta.test_baselines) ? meta.test_baselines : [];
+        const reasons = Array.isArray(item.reasons) ? item.reasons : [];
+
+        return `
+            <div class="active-baseline-card scenario-rag-card" style="display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.85fr);gap:18px;align-items:start;">
+                <div class="scenario-rag-main" style="min-width:0;">
+                    <div class="scenario-rag-title-row">
+                        <span class="muted-text">Score ${Number(item.score || 0)}</span>
+                        <h3 style="margin:.15rem 0;">${escapeHtml(title)}</h3>
+                        ${isTest ? `<div class="muted-text">Parent scenario: ${escapeHtml(meta.scenario_code || item.scenario_code || "")}</div>` : ""}
+                    </div>
+
+                    <div class="baseline-detail" style="margin-top:6px;">
+                        ${escapeHtml(meta.http_method || "")} ${escapeHtml(meta.endpoint || "")}
+                    </div>
+
+                    <div class="scenario-rag-jiras" style="margin-top:10px;">
+                        ${(jiras.length ? jiras : ["No JIRA"]).map(id => `<span class="testing-jira-chip">${escapeHtml(id)}</span>`).join("")}
+                    </div>
+                </div>
+
+                <div class="scenario-rag-side" style="min-width:0;">
+                    <div class="scenario-rag-release" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+                        <span class="tag">${escapeHtml(release)}</span>
+                        <span class="muted-text">${escapeHtml(codeVersion)}</span>
+                    </div>
+
+                    ${tests.length ? `
+                        <div class="testing-history-field" style="margin:0;">
+                            <div class="testing-history-label">Testing baselines</div>
+                            ${tests.map(test => `
+                                <div class="jira-history-line">
+                                    <strong>${escapeHtml(test.name || "Testing baseline")}</strong>
+                                    <span>→</span>
+                                    <span>${escapeHtml(test.status || "NOT_RUN")}</span>
+                                    ${(Array.isArray(test.jira_ids) && test.jira_ids.length)
+                                        ? `<span>→</span>${test.jira_ids.map(id => `<span class="testing-jira-chip">${escapeHtml(id)}</span>`).join("")}`
+                                        : ""}
+                                </div>
+                            `).join("")}
+                        </div>
+                    ` : `<div class="muted-text">No testing baseline captured.</div>`}
+                </div>
+
+                <div class="scenario-rag-footer" style="grid-column:1 / -1;border-top:1px solid rgba(0,0,0,.07);padding-top:10px;">
+                    ${reasons.length ? `<div class="muted-text" style="margin-bottom:8px;">${reasons.map(escapeHtml).join(" · ")}</div>` : ""}
+                    ${item.summary ? `<details class="muted-box" style="margin:0;"><summary>View matched evidence</summary><div>${escapeHtml(item.summary)}</div></details>` : ""}
+                </div>
+            </div>
+        `;
+    }).join("");
+
+    return `
+        <div class="jira-history-text-board scenario-rag-results">
+            <h3>Scenario Registry Results</h3>
+            <div class="muted-text">${Number(data.total_matches || results.length)} match(es) for ${escapeHtml(query)}</div>
+            ${llmPanel}
+            ${historicalPanel}
+            ${cards}
         </div>
     `;
 }
@@ -2332,3 +2617,59 @@ function renderVersionComparison(data) {
         initCodeIntelligenceAccordions();
     }
 })();
+
+
+async function runScenarioRagEvaluation() {
+    const result = document.getElementById("scenarioRagRegistryResult");
+    if (!result) {
+        alert("Full Scenario RAG Registry output area was not found. Refresh the page and try again.");
+        return;
+    }
+    result.innerHTML = `<div class="muted-box">Running automated Scenario RAG evaluation...</div>`;
+    try {
+        const response = await fetch("/api/rag/scenario-registry/evaluate", {method: "POST"});
+        const data = await response.json();
+        if (!response.ok) {
+            const detail = data?.detail;
+            throw new Error(typeof detail === "object" ? JSON.stringify(detail) : (detail || `HTTP ${response.status}`));
+        }
+
+        const cases = Array.isArray(data.cases) ? data.cases : [];
+        result.innerHTML = `
+            <div class="scenario-rag-card">
+                <div class="scenario-rag-card-header">
+                    <div>
+                        <strong>Automated RAG Evaluation</strong>
+                        <div class="muted-text">Positive and negative regression checks using captured Scenario Registry evidence.</div>
+                    </div>
+                    <span class="tag">${escapeHtml(data.status || "")}</span>
+                </div>
+                <div style="display:flex;gap:18px;flex-wrap:wrap;margin:12px 0;">
+                    <div><strong>${Number(data.accuracy_percent || 0).toFixed(2)}%</strong><div class="muted-text">Accuracy</div></div>
+                    <div><strong>${data.passed || 0}</strong><div class="muted-text">Passed</div></div>
+                    <div><strong>${data.failed || 0}</strong><div class="muted-text">Failed</div></div>
+                    <div><strong>${data.total || 0}</strong><div class="muted-text">Total</div></div>
+                </div>
+                ${cases.map(item => `
+                    <div class="attribute-impact-row">
+                        <div style="display:flex;justify-content:space-between;gap:12px;">
+                            <strong>${escapeHtml(item.query || "")}</strong>
+                            <span class="tag">${item.passed ? "PASS" : "FAIL"}</span>
+                        </div>
+                        <div class="muted-text">
+                            ${escapeHtml(item.case_type || "")}
+                            ${item.expected_jira ? ` · Expected JIRA ${escapeHtml(item.expected_jira)}` : " · Expected NO EVIDENCE"}
+                            ${item.expected_test_baseline ? ` · ${escapeHtml(item.expected_test_baseline)}` : ""}
+                        </div>
+                        ${!item.passed && item.actual_evidence?.length ? `
+                            <details style="margin-top:6px;">
+                                <summary>Actual evidence</summary>
+                                <pre>${escapeHtml(JSON.stringify(item.actual_evidence, null, 2))}</pre>
+                            </details>` : ""}
+                    </div>
+                `).join("")}
+            </div>`;
+    } catch (error) {
+        result.innerHTML = renderError(error.message);
+    }
+}

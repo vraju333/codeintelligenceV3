@@ -1,6 +1,9 @@
 import json
+import hashlib
+import difflib
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -9,12 +12,14 @@ from fastapi import HTTPException
 from config import settings
 from sqlalchemy.orm import Session
 
-from baseline_models import ScenarioBaseline, ScenarioBaselineSourceSnapshot, ScenarioTestBaseline
+from baseline_models import ScenarioBaseline, ScenarioBaselineSourceSnapshot, ScenarioTestBaseline, ScenarioReleaseArchive
 from repositories.scenario_baseline_repository import (
     ScenarioBaselineRepository
 )
 from repositories.scenario_repository import ScenarioRepository
 from services.scenario.scenario_service import ScenarioService
+from services.scenario.source_snapshot_diff import capture_sources, compare_sources, unpack, path_key, EXCLUDED
+from services.scenario.baseline_risk_report import build_risk_report
 
 
 class ScenarioBaselineService:
@@ -25,10 +30,22 @@ class ScenarioBaselineService:
             ScenarioBaselineRepository()
         )
 
-    def _find_scenario(self, db: Session, scenario_id: int):
-        return self.scenario_repository.find_by_id(
-            db, scenario_id, settings.PYTHON_PROJECT_PATH
-        )
+    @staticmethod
+    def _canonical_release_month(value: str | None) -> str:
+        """Require and canonicalize release names as 'Month YYYY'."""
+        raw = " ".join(str(value or "").strip().split())
+        match = re.fullmatch(r"([A-Za-z]+)\s+(\d{4})", raw)
+        if not match:
+            raise HTTPException(status_code=400, detail="Baseline must use Month YYYY, for example September 2026")
+        month_text, year_text = match.groups()
+        try:
+            month = datetime.strptime(month_text, "%B").strftime("%B")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid baseline month. Use January through December")
+        year = int(year_text)
+        if year < 2000 or year > 2100:
+            raise HTTPException(status_code=400, detail="Baseline year must be between 2000 and 2100")
+        return f"{month} {year}"
 
     def capture(
         self,
@@ -38,44 +55,72 @@ class ScenarioBaselineService:
         successful_response: Any = None,
         endpoint_flow: dict | None = None
     ):
-        """Create the first release/version baseline for a scenario."""
-        scenario = self._find_scenario(db, scenario_id)
-        if not scenario:
-            raise HTTPException(status_code=404, detail="Scenario not found")
 
-        name = str(baseline_name or "").strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="Release name is required")
+        scenario = (
+            self.scenario_repository.find_by_id(
+                db,
+                scenario_id
+            )
+        )
+
+        if not scenario:
+            raise HTTPException(
+                status_code=404,
+                detail="Scenario not found"
+            )
+
+        name = self._canonical_release_month(baseline_name)
 
         latest = self.baseline_repository.find_latest(db, scenario_id)
         if latest:
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "message": "A baseline already exists. Use Add Baseline to create the next version/release.",
+                    "message": "A Main Baseline already exists for this scenario. Add Test Baselines under the existing Main Baseline instead.",
                     "active_version": latest.baseline_version,
                     "baseline_name": latest.baseline_name,
-                },
+                }
             )
 
-        self.baseline_repository.deactivate_existing(db, scenario_id)
+        next_version = 1
+
+        self.baseline_repository.deactivate_existing(
+            db,
+            scenario_id
+        )
+
         baseline = ScenarioBaseline(
             scenario_id=scenario.id,
             scenario_code=scenario.scenario_code,
-            baseline_version=1,
+            baseline_version=next_version,
             baseline_name=name,
             release_version=1,
             http_method=scenario.http_method,
             endpoint=scenario.endpoint,
-            expected_response_json=self._normalize_json(scenario.expected_response_json),
-            successful_response_json=self._normalize_json(successful_response),
+            expected_response_json=self._normalize_json(
+                scenario.expected_response_json
+            ),
+            successful_response_json=self._normalize_json(
+                successful_response
+            ),
             expected_db_effect=scenario.expected_db_effect,
-            involved_classes=self._normalize_list(scenario.involved_classes),
+            involved_classes=self._normalize_list(
+                scenario.involved_classes
+            ),
             endpoint_flow=endpoint_flow,
-            is_active=True,
+            is_active=True
         )
-        created = self.baseline_repository.create(db, baseline)
-        self._capture_source_snapshot(db=db, baseline=created)
+
+        created = self.baseline_repository.create(
+            db,
+            baseline
+        )
+
+        self._capture_source_snapshot(
+            db=db,
+            baseline=created
+        )
+
         return created
 
     def create_next_baseline(
@@ -86,29 +131,59 @@ class ScenarioBaselineService:
         successful_response: Any = None,
         endpoint_flow: dict | None = None
     ):
-        """Compatibility route for an intentional next baseline version."""
-        scenario = self._find_scenario(db, scenario_id)
+        """Create the next intentional Main Baseline version for a scenario.
+
+        The first baseline must be created through ``capture``. This method is only
+        for moving an existing scenario from Vn to Vn+1 and rejects an identical
+        code/flow snapshot so users cannot accidentally create duplicate versions.
+        """
+        scenario = self.scenario_repository.find_by_id(db, scenario_id)
         if not scenario:
             raise HTTPException(status_code=404, detail="Scenario not found")
+
+        name = self._canonical_release_month(baseline_name)
+
         latest = self.baseline_repository.find_latest(db, scenario_id)
         if not latest:
-            raise HTTPException(status_code=409, detail="Create the first baseline first")
+            raise HTTPException(
+                status_code=409,
+                detail="Create the first Main Baseline before creating a new version"
+            )
+
         if not self._code_or_flow_changed(db, scenario, latest, endpoint_flow):
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "message": "No relevant Python code or flow changes were detected since the current baseline.",
+                    "message": "No code or flow changes were detected since the current Main Baseline. Keep using the existing baseline for Test Baselines.",
                     "active_version": latest.baseline_version,
                     "baseline_name": latest.baseline_name,
-                },
+                }
             )
-        return self.create_release_version(
-            db=db,
-            scenario_id=scenario_id,
-            release_name=baseline_name,
-            successful_response=successful_response,
+
+        next_version = int(latest.baseline_version or 0) + 1
+        same_release = self.baseline_repository.find_release_versions(db, scenario_id, name)
+        release_version = max([int(x.release_version or 0) for x in same_release] + [0]) + 1
+        self.baseline_repository.deactivate_existing(db, scenario_id)
+
+        baseline = ScenarioBaseline(
+            scenario_id=scenario.id,
+            scenario_code=scenario.scenario_code,
+            baseline_version=next_version,
+            baseline_name=name,
+            release_version=release_version,
+            http_method=scenario.http_method,
+            endpoint=scenario.endpoint,
+            expected_response_json=self._normalize_json(scenario.expected_response_json),
+            successful_response_json=self._normalize_json(successful_response),
+            expected_db_effect=scenario.expected_db_effect,
+            involved_classes=self._normalize_list(scenario.involved_classes),
             endpoint_flow=endpoint_flow,
+            is_active=True
         )
+
+        created = self.baseline_repository.create(db, baseline)
+        self._capture_source_snapshot(db=db, baseline=created)
+        return created
 
     def create_release_version(
         self,
@@ -118,32 +193,22 @@ class ScenarioBaselineService:
         successful_response: Any = None,
         endpoint_flow: dict | None = None
     ):
-        """Create October V2/V3 or November V1 while keeping a global internal version."""
-        scenario = self._find_scenario(db, scenario_id)
+        """Create the next version inside a release, or V1 for a new release.
+
+        baseline_version is the internal monotonically increasing id used by
+        source comparison. release_version is what the UI displays (October V1,
+        October V2, November V1, ...).
+        """
+        scenario = self.scenario_repository.find_by_id(db, scenario_id)
         if not scenario:
             raise HTTPException(status_code=404, detail="Scenario not found")
 
-        name = str(release_name or "").strip()
-        if not name:
-            raise HTTPException(status_code=400, detail="Release name is required")
+        name = self._canonical_release_month(release_name)
 
         latest = self.baseline_repository.find_latest(db, scenario_id)
         next_global_version = int(latest.baseline_version or 0) + 1 if latest else 1
         release_versions = self.baseline_repository.find_release_versions(db, scenario_id, name)
         next_release_version = max([int(x.release_version or 0) for x in release_versions] + [0]) + 1
-
-        # The first baseline is always allowed. Later versions are intentional captures;
-        # duplicate prevention protects accidental Vn+1 creation when source+flow are unchanged.
-        if latest and not self._code_or_flow_changed(db, scenario, latest, endpoint_flow):
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "message": "No relevant Python code or flow change detected. A duplicate baseline version was not created.",
-                    "active_version": latest.baseline_version,
-                    "baseline_name": latest.baseline_name,
-                    "suggestion": "Keep adding Test Baselines to the existing version until code changes.",
-                },
-            )
 
         self.baseline_repository.deactivate_existing(db, scenario_id)
         baseline = ScenarioBaseline(
@@ -159,7 +224,7 @@ class ScenarioBaselineService:
             expected_db_effect=scenario.expected_db_effect,
             involved_classes=self._normalize_list(scenario.involved_classes),
             endpoint_flow=endpoint_flow,
-            is_active=True,
+            is_active=True
         )
         created = self.baseline_repository.create(db, baseline)
         self._capture_source_snapshot(db=db, baseline=created)
@@ -175,16 +240,59 @@ class ScenarioBaselineService:
         actual_response: Any = None,
         expected_db_effect: str | None = None,
         jira_ids: list[str] | None = None,
-        endpoint_flow: dict | None = None,
+        endpoint_flow: dict | None = None
     ):
+        """Legacy combined baseline endpoint. Main and Test Baselines are now separate."""
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "Release/Version Baseline and Test Baseline are separate. Create/select a Release Version first, then add Test Baselines under it.",
-                "baseline_endpoint": f"/api/scenario-baselines/release-version/{scenario_id}",
+                "message": "Main Baseline and Test Baseline are separate. Create the Main Baseline first, then add Test Baselines under it.",
+                "main_baseline_endpoint": f"/api/scenario-baselines/capture/{scenario_id}",
                 "test_baseline_endpoint": f"/api/scenario-baselines/testing/{scenario_id}",
-            },
+            }
         )
+
+    @staticmethod
+    def _testing_payload_signature(request_json, expected_response, actual_response, expected_db_effect, jira_ids, status):
+        payload = {
+            "request_json": request_json,
+            "expected_response": expected_response,
+            "actual_response": actual_response,
+            "expected_db_effect": expected_db_effect or None,
+            "jira_ids": sorted(jira_ids or []),
+            "status": status,
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _stored_testing_payload_signature(self, record):
+        if not record:
+            return ""
+        return self._testing_payload_signature(
+            record.request_json, record.expected_response_json, record.actual_response_json,
+            record.expected_db_effect, record.jira_ids or [], record.status
+        )
+
+    def _code_or_flow_changed(self, db: Session, scenario, latest: ScenarioBaseline, endpoint_flow: dict | None) -> bool:
+        latest_snapshot = self.baseline_repository.find_source_snapshot(db, latest.id)
+        if not latest_snapshot or latest_snapshot.source_snapshot is None:
+            return True
+
+        class_names = set(self._normalize_list(scenario.involved_classes))
+        class_names.update(self._flow_classes(endpoint_flow))
+        class_names.update(self._flow_classes(latest.endpoint_flow))
+        project_path = Path(settings.JAVA_PROJECT_PATH).resolve()
+        current_source = self._read_relevant_java_sources(
+            project_path=project_path, class_names=class_names
+        )
+        previous, _ = unpack(latest_snapshot.source_snapshot)
+        if latest_snapshot.source_snapshot.get("format_version") != 2:
+            current_source = {path: text.replace("\r\n", "\n").replace("\r", "\n")
+                              for path, text in current_source.items()}
+        previous = {path: content for path, content in previous.items()
+                    if not class_names or Path(path).stem in {str(name).split('.')[-1] for name in class_names}}
+        source_changed = current_source != previous
+        flow_changed = self._flow_signature(endpoint_flow) != self._flow_signature(latest.endpoint_flow)
+        return source_changed or flow_changed
 
     def create_test_baseline(
         self,
@@ -196,15 +304,15 @@ class ScenarioBaselineService:
         expected_response: Any = None,
         actual_response: Any = None,
         expected_db_effect: str | None = None,
-        jira_ids: list[str] | None = None,
+        jira_ids: list[str] | None = None
     ):
-        scenario = self._find_scenario(db, scenario_id)
+        scenario = self.scenario_repository.find_by_id(db, scenario_id)
         if not scenario:
             raise HTTPException(status_code=404, detail="Scenario not found")
 
         name = str(baseline_name or "").strip()
         if not name:
-            raise HTTPException(status_code=400, detail="Test Scenario is required")
+            raise HTTPException(status_code=400, detail="Testing baseline name is required")
 
         target_code_baseline = (
             self.baseline_repository.find_by_id(db, scenario_id, baseline_id)
@@ -214,7 +322,7 @@ class ScenarioBaselineService:
         if not target_code_baseline:
             raise HTTPException(
                 status_code=409,
-                detail="Select a valid Release/Version before adding a Test Baseline",
+                detail="Select a valid Release/Version before adding a Test Baseline"
             )
 
         existing = self.baseline_repository.find_test_baseline_by_name(
@@ -223,11 +331,11 @@ class ScenarioBaselineService:
         if existing:
             raise HTTPException(
                 status_code=409,
-                detail=f"Test Scenario '{name}' already exists for the selected version",
+                detail=f"Test Scenario '{name}' already exists for the selected version"
             )
-
         normalized_expected = self._normalize_json(expected_response)
         normalized_actual = self._normalize_json(actual_response)
+
         if actual_response is None:
             status = "NOT_RUN"
         elif normalized_expected == normalized_actual:
@@ -247,9 +355,123 @@ class ScenarioBaselineService:
             jira_ids=self._normalize_jira_ids(jira_ids),
             status=status,
             code_baseline_version=target_code_baseline.baseline_version,
-            baseline_id=target_code_baseline.id,
+            baseline_id=target_code_baseline.id
         )
         return self.baseline_repository.create_test_baseline(db, record)
+
+    def update_test_baseline(
+        self, db: Session, scenario_id: int, test_baseline_id: int,
+        baseline_name: str, request_json: Any = None,
+        expected_response: Any = None, actual_response: Any = None,
+        expected_db_effect: str | None = None, jira_ids: list[str] | None = None
+    ):
+        scenario = self.scenario_repository.find_by_id(db, scenario_id)
+        if not scenario:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+
+        record = self.baseline_repository.find_test_baseline_by_id(db, scenario_id, test_baseline_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Test Baseline not found")
+
+        if record.baseline_id and self.baseline_repository.find_release_archive(db, record.baseline_id):
+            raise HTTPException(status_code=409, detail="Archived release versions are read-only")
+
+        name = str(baseline_name or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Testing baseline name is required")
+
+        duplicate = self.baseline_repository.find_test_baseline_by_name(
+            db, scenario_id, name, record.code_baseline_version
+        )
+        if duplicate and int(duplicate.id) != int(record.id):
+            raise HTTPException(status_code=409, detail=f"Test Scenario '{name}' already exists for the selected version")
+
+        expected = self._normalize_json(expected_response)
+        actual = self._normalize_json(actual_response)
+        status = "NOT_RUN" if actual_response is None else ("PASS" if expected == actual else "FAIL")
+
+        record.baseline_name = name
+        record.request_json = self._normalize_json(request_json)
+        record.expected_response_json = expected
+        record.actual_response_json = actual
+        record.expected_db_effect = expected_db_effect or scenario.expected_db_effect
+        record.jira_ids = self._normalize_jira_ids(jira_ids)
+        record.status = status
+        return self.baseline_repository.update_test_baseline(db, record)
+
+    def archive_release(self, db: Session, scenario_id: int, baseline_id: int):
+        scenario = self.scenario_repository.find_by_id(db, scenario_id)
+        if not scenario:
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        baseline = self.baseline_repository.find_by_id(db, scenario_id, baseline_id)
+        if not baseline:
+            raise HTTPException(status_code=404, detail="Release baseline not found")
+        if self.baseline_repository.find_release_archive(db, baseline.id):
+            raise HTTPException(status_code=409, detail="This release/version is already archived")
+
+        tests = self.baseline_repository.find_test_baselines_for_code_version(
+            db, scenario_id, int(baseline.baseline_version)
+        )
+        source = self.baseline_repository.find_source_snapshot(db, baseline.id)
+        snapshot = {
+            "scenario": {
+                "id": scenario.id, "scenario_code": scenario.scenario_code,
+                "scenario_name": scenario.scenario_name,
+                "http_method": scenario.http_method, "endpoint": scenario.endpoint
+            },
+            "release": {
+                "baseline_id": baseline.id, "baseline_name": baseline.baseline_name,
+                "release_version": int(baseline.release_version or 1),
+                "code_baseline_version": int(baseline.baseline_version or 1),
+                "expected_response_json": baseline.expected_response_json,
+                "successful_response_json": baseline.successful_response_json,
+                "expected_db_effect": baseline.expected_db_effect,
+                "involved_classes": baseline.involved_classes,
+                "endpoint_flow": baseline.endpoint_flow,
+                "created_at": baseline.created_at.isoformat() if baseline.created_at else None
+            },
+            "test_baselines": [{
+                "id": x.id, "baseline_name": x.baseline_name,
+                "request_json": x.request_json,
+                "expected_response_json": x.expected_response_json,
+                "actual_response_json": x.actual_response_json,
+                "expected_db_effect": x.expected_db_effect,
+                "jira_ids": list(x.jira_ids or []), "status": x.status,
+                "created_at": x.created_at.isoformat() if x.created_at else None
+            } for x in tests],
+            "source_snapshot": source.source_snapshot if source else None,
+            "source_changes": source.source_changes if source else None,
+            "git_diff": source.git_diff if source else None
+        }
+        canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), default=str)
+        archive = ScenarioReleaseArchive(
+            scenario_id=scenario_id, baseline_id=baseline.id,
+            baseline_name=str(baseline.baseline_name or "Legacy"),
+            release_version=int(baseline.release_version or 1),
+            code_baseline_version=int(baseline.baseline_version or 1),
+            snapshot_json=snapshot,
+            snapshot_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        )
+        return self.baseline_repository.create_release_archive(db, archive)
+
+    def get_release_archives(self, db: Session, scenario_id: int):
+        if not self.scenario_repository.find_by_id(db, scenario_id):
+            raise HTTPException(status_code=404, detail="Scenario not found")
+        return [{
+            "id": x.id, "scenario_id": x.scenario_id, "baseline_id": x.baseline_id,
+            "baseline_name": x.baseline_name, "release_version": x.release_version,
+            "code_baseline_version": x.code_baseline_version,
+            "snapshot_hash": x.snapshot_hash,
+            "archived_at": x.archived_at.isoformat() if x.archived_at else None,
+            "snapshot": x.snapshot_json
+        } for x in self.baseline_repository.find_release_archives_for_scenario(db, scenario_id)]
+
+    def get_release_archive_status(self, db: Session, scenario_id: int):
+        return {str(x.baseline_id): {
+            "archived": True, "archive_id": x.id,
+            "archived_at": x.archived_at.isoformat() if x.archived_at else None,
+            "snapshot_hash": x.snapshot_hash
+        } for x in self.baseline_repository.find_release_archives_for_scenario(db, scenario_id)}
 
     @staticmethod
     def _normalize_jira_ids(jira_ids: list[str] | None) -> list[str]:
@@ -264,9 +486,7 @@ class ScenarioBaselineService:
         return result
 
     def get_test_baselines(self, db: Session, scenario_id: int):
-        scenario = self.scenario_repository.find_by_id(
-            db, scenario_id, settings.PYTHON_PROJECT_PATH
-        )
+        scenario = self.scenario_repository.find_by_id(db, scenario_id)
         if not scenario:
             raise HTTPException(status_code=404, detail="Scenario not found")
         return self.baseline_repository.find_test_baselines(db, scenario_id)
@@ -277,6 +497,15 @@ class ScenarioBaselineService:
             raise HTTPException(status_code=400, detail="JIRA ID is required")
 
         scenarios = ScenarioService().get_all_for_active_project(db)
+        scenario_by_id = {scenario.id: scenario for scenario in scenarios}
+        if not scenario_by_id:
+            return {
+                "jira_id": jira_id,
+                "covered_count": 0,
+                "scenario_count": 0,
+                "items": [],
+            }
+
         items = []
         for scenario in scenarios:
             for baseline in self.baseline_repository.find_test_baselines(db, scenario.id):
@@ -299,17 +528,26 @@ class ScenarioBaselineService:
                     if code_baseline and code_baseline.release_version
                     else baseline.code_baseline_version
                 )
+
                 items.append({
                     "jira_id": jira_id,
                     "scenario_id": scenario.id,
                     "scenario_code": scenario.scenario_code,
                     "scenario_name": scenario.scenario_name,
+                    "http_method": scenario.http_method,
+                    "endpoint": scenario.endpoint,
+                    "testing_baseline_id": baseline.id,
                     "testing_baseline_name": baseline.baseline_name,
                     "status": baseline.status,
                     "release_name": release_name,
                     "release_version": release_version,
                     "code_baseline_version": baseline.code_baseline_version,
+                    "related_jiras": baseline_jiras,
                     "created_at": baseline.created_at.isoformat() if baseline.created_at else None,
+                    "has_request": baseline.request_json is not None,
+                    "has_expected_response": baseline.expected_response_json is not None,
+                    "has_actual_response": baseline.actual_response_json is not None,
+                    "has_db_effect": bool(baseline.expected_db_effect),
                 })
 
         items.sort(
@@ -336,8 +574,7 @@ class ScenarioBaselineService:
         scenario = (
             self.scenario_repository.find_by_id(
                 db,
-                scenario_id,
-                settings.PYTHON_PROJECT_PATH
+                scenario_id
             )
         )
 
@@ -371,8 +608,7 @@ class ScenarioBaselineService:
         scenario = (
             self.scenario_repository.find_by_id(
                 db,
-                scenario_id,
-                settings.PYTHON_PROJECT_PATH
+                scenario_id
             )
         )
 
@@ -441,9 +677,7 @@ class ScenarioBaselineService:
         from_version: int,
         to_version: int
     ):
-        scenario = self.scenario_repository.find_by_id(
-            db, scenario_id, settings.PYTHON_PROJECT_PATH
-        )
+        scenario = self.scenario_repository.find_by_id(db, scenario_id)
         if not scenario:
             raise HTTPException(status_code=404, detail="Scenario not found")
 
@@ -467,15 +701,9 @@ class ScenarioBaselineService:
             old_baseline=old,
             new_baseline=new
         )
-
-        # A scenario baseline is meant to explain changes relevant to that
-        # scenario, not every edit in a broad parent entity that happens to
-        # appear in its stored execution flow. Example: adding Student.eligibility
-        # must not make STUDENT_CONTACT_UPDATE look changed.
-        source_comparison = self._filter_source_comparison_for_scenario(
-            scenario_code=scenario.scenario_code,
-            endpoint=new.endpoint,
-            source_comparison=source_comparison,
+        testing_comparison = self._compare_testing_baselines(
+            db=db, scenario_id=scenario_id,
+            from_version=from_version, to_version=to_version
         )
 
         endpoint_changed = old.endpoint != new.endpoint or old.http_method != new.http_method
@@ -491,12 +719,24 @@ class ScenarioBaselineService:
         )
         source_change_count = len(source_comparison.get("changes") or [])
         changed_file_count = len(source_comparison.get("changed_files") or [])
+        risk_report = build_risk_report(
+            source_comparison, endpoint_changed, db_effect_changed,
+            added_methods, removed_methods,
+            self.baseline_repository.find_test_baselines_for_code_version(db, scenario_id, to_version),
+            scenario.scenario_code,
+            old_classes | new_classes | self._flow_classes(old.endpoint_flow) | self._flow_classes(new.endpoint_flow),
+        )
 
         return {
+            "risk_report": risk_report,
             "scenario_id": scenario_id,
             "scenario_code": scenario.scenario_code,
             "from_version": from_version,
             "to_version": to_version,
+            "from_release_name": old.baseline_name,
+            "to_release_name": new.baseline_name,
+            "from_release_version": old.release_version or old.baseline_version,
+            "to_release_version": new.release_version or new.baseline_version,
             "endpoint_changed": endpoint_changed,
             "from_endpoint": f"{old.http_method} {old.endpoint}",
             "to_endpoint": f"{new.http_method} {new.endpoint}",
@@ -512,6 +752,7 @@ class ScenarioBaselineService:
             "from_db_effect": old.expected_db_effect,
             "to_db_effect": new.expected_db_effect,
             "source_comparison": source_comparison,
+            "testing_comparison": testing_comparison,
             "change_summary": {
                 "changed_source_files": changed_file_count,
                 "classified_source_changes": source_change_count,
@@ -527,7 +768,7 @@ class ScenarioBaselineService:
             "scenario_impact": {
                 "scenario_code": scenario.scenario_code,
                 "endpoint": f"{new.http_method} {new.endpoint}",
-                "version_transition": f"V{from_version} → V{to_version}",
+                "version_transition": f"{old.baseline_name or 'Release'} V{old.release_version or old.baseline_version} → {new.baseline_name or 'Release'} V{new.release_version or new.baseline_version}",
                 "changed": bool(
                     endpoint_changed
                     or db_effect_changed
@@ -539,29 +780,49 @@ class ScenarioBaselineService:
                     or expected_change_count
                     or source_change_count
                     or changed_file_count
+                    or testing_comparison.get("changed")
                 ),
             },
         }
 
-    def _code_or_flow_changed(self, db: Session, scenario, latest: ScenarioBaseline, endpoint_flow: dict | None) -> bool:
-        latest_snapshot = self.baseline_repository.find_source_snapshot(db, latest.id)
-        if not latest_snapshot or latest_snapshot.source_snapshot is None:
-            return True
+    def _compare_testing_baselines(self, db: Session, scenario_id: int, from_version: int, to_version: int) -> dict:
+        old_items = self.baseline_repository.find_test_baselines_for_code_version(db, scenario_id, from_version)
+        new_items = self.baseline_repository.find_test_baselines_for_code_version(db, scenario_id, to_version)
+        if not old_items and not new_items:
+            return {"available": False, "changed": False}
 
-        class_names = set(self._normalize_list(scenario.involved_classes))
-        class_names.update(self._flow_classes(endpoint_flow))
-        class_names.update(self._flow_classes(latest.endpoint_flow))
-        project_path = Path(settings.PYTHON_PROJECT_PATH).resolve()
-        current_source = self._read_relevant_java_sources(
-            project_path=project_path,
-            class_names=class_names,
-        )
-        source_changed = current_source != (latest_snapshot.source_snapshot or {})
-        flow_changed = self._flow_signature(endpoint_flow) != self._flow_signature(latest.endpoint_flow)
-        git_diff_changed = bool(
-            self._current_git_diff(project_path).strip()
-        )
-        return source_changed or flow_changed or git_diff_changed
+        def summarize(items):
+            names = [x.baseline_name for x in items]
+            jiras = sorted({jira for x in items for jira in (x.jira_ids or [])})
+            statuses = [x.status for x in items]
+            return {"names": names, "jiras": jiras, "statuses": statuses}
+
+        old_summary = summarize(old_items)
+        new_summary = summarize(new_items)
+        changed = old_summary != new_summary
+        old_latest = old_items[-1] if old_items else None
+        new_latest = new_items[-1] if new_items else None
+
+        return {
+            "available": True,
+            "changed": changed,
+            "from_name": ", ".join(old_summary["names"]) if old_summary["names"] else None,
+            "to_name": ", ".join(new_summary["names"]) if new_summary["names"] else None,
+            "from_test_scenarios": old_summary["names"],
+            "to_test_scenarios": new_summary["names"],
+            "request_changes": self._json_diff(old_latest.request_json if old_latest else None, new_latest.request_json if new_latest else None),
+            "expected_response_changes": self._json_diff(old_latest.expected_response_json if old_latest else None, new_latest.expected_response_json if new_latest else None),
+            "actual_response_changes": self._json_diff(old_latest.actual_response_json if old_latest else None, new_latest.actual_response_json if new_latest else None),
+            "db_effect_changed": (old_latest.expected_db_effect if old_latest else None) != (new_latest.expected_db_effect if new_latest else None),
+            "from_db_effect": old_latest.expected_db_effect if old_latest else None,
+            "to_db_effect": new_latest.expected_db_effect if new_latest else None,
+            "jira_changed": old_summary["jiras"] != new_summary["jiras"],
+            "from_jiras": old_summary["jiras"],
+            "to_jiras": new_summary["jiras"],
+            "status_changed": old_summary["statuses"] != new_summary["statuses"],
+            "from_status": ", ".join(old_summary["statuses"]) if old_summary["statuses"] else None,
+            "to_status": ", ".join(new_summary["statuses"]) if new_summary["statuses"] else None,
+        }
 
     def _ensure_relevant_change_before_new_version(
         self,
@@ -577,7 +838,7 @@ class ScenarioBaselineService:
         class_names.update(self._flow_classes(endpoint_flow))
         class_names.update(self._flow_classes(latest.endpoint_flow))
 
-        project_path = Path(settings.PYTHON_PROJECT_PATH).resolve()
+        project_path = Path(settings.JAVA_PROJECT_PATH).resolve()
         current_source = self._read_relevant_java_sources(
             project_path=project_path,
             class_names=class_names
@@ -587,7 +848,13 @@ class ScenarioBaselineService:
         # the code is unchanged, so allow one capture to establish the new
         # source-aware history. From then on duplicate versions are blocked.
         if latest_snapshot and latest_snapshot.source_snapshot is not None:
-            previous_source = latest_snapshot.source_snapshot or {}
+            previous_source, _ = unpack(latest_snapshot.source_snapshot)
+            if latest_snapshot.source_snapshot.get("format_version") != 2:
+                current_source = {path: text.replace("\r\n", "\n").replace("\r", "\n")
+                                  for path, text in current_source.items()}
+            wanted = {str(name).split('.')[-1] for name in class_names}
+            previous_source = {path: content for path, content in previous_source.items()
+                               if not wanted or Path(path).stem in wanted}
             source_changed = current_source != previous_source
             flow_changed = self._flow_signature(endpoint_flow) != self._flow_signature(latest.endpoint_flow)
 
@@ -625,29 +892,15 @@ class ScenarioBaselineService:
         """
         Persist the source state that belongs to a baseline version.
 
-        We snapshot only classes participating in the scenario flow, rather
-        than the entire Python project.  We also store the current Git diff so
-        the first capture after this feature can still explain V1 -> V2 even
-        when V1 predates source snapshots.
+        Store a complete Java-source inventory so changing flow membership
+        cannot masquerade as source-file additions or deletions.
         """
         try:
             project_path = Path(
-                settings.PYTHON_PROJECT_PATH
+                settings.JAVA_PROJECT_PATH
             ).resolve()
 
-            class_names = set(
-                baseline.involved_classes or []
-            )
-            class_names.update(
-                self._flow_classes(
-                    baseline.endpoint_flow
-                )
-            )
-
-            snapshot = self._read_relevant_java_sources(
-                project_path=project_path,
-                class_names=class_names
-            )
+            snapshot = capture_sources(project_path)
 
             git_diff = self._current_git_diff(
                 project_path
@@ -672,7 +925,7 @@ class ScenarioBaselineService:
 
         except Exception:
             # A baseline capture must not fail just because source snapshotting
-            # is unavailable (for example, a non-Git copy of a Python project).
+            # is unavailable (for example, a non-Git copy of a Java project).
             db.rollback()
 
 
@@ -723,37 +976,22 @@ class ScenarioBaselineService:
         if not project_path.exists():
             return result
 
-        ignored_dirs = {
-            ".git",
-            ".idea",
-            ".vscode",
-            ".venv",
-            "venv",
-            "env",
-            "__pycache__",
-            "site-packages",
-            "node_modules",
-            "dist",
-            "build",
-            ".pytest_cache",
+        wanted = {
+            str(name).split(".")[-1]
+            for name in class_names
+            if name
         }
 
-        for java_file in project_path.rglob("*.py"):
-            if any(part in ignored_dirs for part in java_file.parts):
+        for java_file in project_path.rglob("*.java"):
+            if any(part in EXCLUDED for part in java_file.relative_to(project_path).parts):
+                continue
+            if wanted and java_file.stem not in wanted:
                 continue
 
             try:
-                relative = str(
-                    java_file.relative_to(
-                        project_path
-                    )
-                ).replace("\\\\", "/")
-
-                result[relative] = (
-                    java_file.read_text(
-                        encoding="utf-8"
-                    )
-                )
+                relative = java_file.relative_to(project_path).as_posix()
+                with java_file.open(encoding="utf-8", newline="") as stream:
+                    result[relative] = stream.read()
             except Exception:
                 continue
 
@@ -830,7 +1068,7 @@ class ScenarioBaselineService:
         raw_diff: str
     ) -> list[dict]:
         """
-        Small Python-aware classifier for the Version History UI.
+        Small Java-aware classifier for the Version History UI.
         It intentionally keeps the raw diff as the source of truth.
         """
         if not raw_diff:
@@ -868,6 +1106,9 @@ class ScenarioBaselineService:
         )
 
         for line in raw_diff.splitlines():
+            if line.startswith("--- a/"):
+                current_file = line[6:]
+                continue
             if line.startswith("+++ b/"):
                 current_file = line[6:]
                 continue
@@ -987,7 +1228,7 @@ class ScenarioBaselineService:
         """
         Keep source-level evidence scenario-specific for focused child updates.
 
-        For STUDENT_CONTACT_UPDATE, for example, Student.py remains a broad
+        For STUDENT_CONTACT_UPDATE, for example, Student.java remains a broad
         execution dependency but an unrelated field such as `eligibility`
         should not be shown as a contact-scenario change.
 
@@ -1014,7 +1255,7 @@ class ScenarioBaselineService:
             code = str(change.get("code") or "").lower()
 
             # A dedicated resource class/file is always directly relevant:
-            # ContactDetails.py, ContactDetailsMapper.py, EmailDetails..., etc.
+            # ContactDetails.java, ContactDetailsMapper.java, EmailDetails..., etc.
             if any(token in file_path for token in aliases):
                 return True
 
@@ -1074,121 +1315,62 @@ class ScenarioBaselineService:
         project_mismatch = bool(
             old_project_path
             and new_project_path
-            and Path(old_project_path).resolve() != Path(new_project_path).resolve()
+            and path_key(old_project_path) != path_key(new_project_path)
         )
 
-        # If the older baseline predates this feature, the Git diff captured
-        # alongside the newer baseline is the best available V1 -> V2 evidence.
-        if not old_snapshot and new_snapshot:
+        if project_mismatch:
             return {
-                "snapshot_status": "PREVIOUS_SNAPSHOT_UNAVAILABLE",
+                "snapshot_status": "PROJECT_MISMATCH",
                 "from_project_path": old_project_path,
                 "to_project_path": new_project_path,
-                "project_mismatch": False,
-                "message": (
-                    f"V{old_baseline.baseline_version} was captured before "
-                    "source snapshots were enabled. Showing the Git changes "
-                    f"stored when V{new_baseline.baseline_version} was captured."
-                ),
-                "changed_files": self._files_from_git_changes(
-                    new_snapshot.source_changes or []
-                ),
-                "changes": new_snapshot.source_changes or [],
-                "raw_diff": new_snapshot.git_diff or ""
+                "project_mismatch": True,
+                "message": "These versions belong to different project paths; source comparison is unavailable.",
+                "changed_files": [], "changes": [], "raw_diff": ""
             }
 
-        if not old_snapshot or not new_snapshot:
+        if (not old_snapshot or not new_snapshot
+                or old_snapshot.source_snapshot is None or new_snapshot.source_snapshot is None):
             return {
                 "snapshot_status": "UNAVAILABLE",
                 "from_project_path": old_project_path,
                 "to_project_path": new_project_path,
                 "project_mismatch": False,
                 "message": (
-                    "Source snapshots are unavailable for one or both versions."
+                    "Source snapshots are unavailable for one or both versions. "
+                    "A working-tree Git diff cannot reconstruct this historical comparison."
                 ),
                 "changed_files": [],
                 "changes": [],
                 "raw_diff": ""
             }
 
-        old_sources = old_snapshot.source_snapshot or {}
-        new_sources = new_snapshot.source_snapshot or {}
-
-        old_files = set(
-            old_sources
-        )
-        new_files = set(
-            new_sources
-        )
-
-        changed_files = []
-
-        for file_path in sorted(
-            old_files | new_files
-        ):
-            before = old_sources.get(
-                file_path
-            )
-            after = new_sources.get(
-                file_path
-            )
-
-            if before == after:
-                continue
-
-            if before is None:
-                status = "ADDED"
-            elif after is None:
-                status = "REMOVED"
-            else:
-                status = "MODIFIED"
-
-            changed_files.append({
-                "file_path": file_path,
-                "status": status
-            })
-
-        # Prefer the Git classification captured with V2 because it identifies
-        # changed files/symbols cleanly. Snapshot comparison remains useful, but
-        # older Python baselines may have stored only a narrow scenario snapshot
-        # while newer baselines store the whole Python source tree. In that
-        # mixed case, unchanged existing files look like false ADDED files.
-        changes = (
-            new_snapshot.source_changes
-            or []
-        )
-        git_changed_files = (
-            self._files_from_git_changes(changes)
-            or self._files_from_raw_git_diff(new_snapshot.git_diff or "")
-        )
-
-        added_only_from_snapshot_shape_change = (
-            git_changed_files
-            and changed_files
-            and all(item.get("status") == "ADDED" for item in changed_files)
-            and len(changed_files) > len(git_changed_files)
-        )
-
-        if added_only_from_snapshot_shape_change:
-            changed_files = git_changed_files
-
-        return {
-            "snapshot_status": "AVAILABLE",
+        comparison = compare_sources(old_snapshot.source_snapshot, new_snapshot.source_snapshot)
+        comparison.update({
             "from_project_path": old_project_path,
             "to_project_path": new_project_path,
-            "project_mismatch": project_mismatch,
-            "message": (
-                "These two baselines were captured from different Python project paths. "
-                "Execution-flow differences are shown, but they must not be interpreted "
-                "as source-file additions or deletions across one project."
-                if project_mismatch
-                else None
-            ),
-            "changed_files": ([] if project_mismatch else changed_files),
-            "changes": ([] if project_mismatch else changes),
-            "raw_diff": ("" if project_mismatch else (new_snapshot.git_diff or ""))
-        }
+            "project_mismatch": False,
+            "changes": self._classify_git_diff(comparison["raw_diff"]),
+            "scope": "Stored Java source files; file changes are not proof of scenario impact",
+        })
+        return comparison
 
+
+    @staticmethod
+    def _build_snapshot_pair_diff(old_sources: dict, new_sources: dict) -> str:
+        chunks = []
+        for file_path in sorted(set(old_sources or {}) | set(new_sources or {})):
+            before = (old_sources or {}).get(file_path)
+            after = (new_sources or {}).get(file_path)
+            if before == after:
+                continue
+            before_lines = (before or "").splitlines()
+            after_lines = (after or "").splitlines()
+            chunks.extend(difflib.unified_diff(
+                before_lines, after_lines,
+                fromfile=f"a/{file_path}", tofile=f"b/{file_path}",
+                lineterm=""
+            ))
+        return "\n".join(chunks)
 
     def _files_from_git_changes(
         self,
@@ -1211,47 +1393,6 @@ class ScenarioBaselineService:
         return list(
             files.values()
         )
-
-
-    def _files_from_raw_git_diff(
-        self,
-        raw_diff: str
-    ) -> list[dict]:
-        files = {}
-
-        if not raw_diff:
-            return []
-
-        current_old_path = None
-
-        for line in raw_diff.splitlines():
-            if line.startswith("--- a/"):
-                current_old_path = line[6:].strip()
-                continue
-
-            if not line.startswith("+++ b/"):
-                continue
-
-            new_path = line[6:].strip()
-            if not new_path or new_path == "/dev/null":
-                path = current_old_path
-                status = "REMOVED"
-            elif current_old_path in (None, "/dev/null"):
-                path = new_path
-                status = "ADDED"
-            else:
-                path = new_path
-                status = "MODIFIED"
-
-            if not path:
-                continue
-
-            files[path] = {
-                "file_path": path,
-                "status": status
-            }
-
-        return list(files.values())
 
 
     def _flow_methods(self, flow):

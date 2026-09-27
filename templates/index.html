@@ -133,29 +133,60 @@ Example: Add employmentType attribute to Employee. Store it while creating an em
                 Enter an attribute to see its project-wide blast radius.
             </div>
 </div></section>
+<!-- BASELINE OVERVIEW / HISTORY -->
 <!-- ====================================================== -->
-<!-- SCENARIO REGISTRY -->
-<!-- ====================================================== -->
-<section class="card accordion-card is-collapsed" id="scenario-registry">
-<div aria-expanded="false" class="card-header accordion-header" data-accordion-title="Scenario Registry" role="button" tabindex="0">
+<section class="card accordion-card is-collapsed" id="scenario-baselines">
+<div aria-expanded="false" class="card-header accordion-header" data-accordion-title="Scenario Baselines" role="button" tabindex="0">
 <div>
-<h2>
-                        Scenario Registry
-                    </h2>
-<p>
-                        Registered application scenarios
-                    </p>
+<h2>Scenario Baselines</h2>
+<p>One scenario per HTTP operation. Keep code versions separate from repeatable monthly/testing baselines.</p>
 </div>
 <div class="header-actions">
-<button type="button" onclick="openNewScenarioModal()">+ New Scenario</button>
-<button type="button" class="secondary-button" onclick="refreshScenarioRegistryAndDefect()">Refresh</button>
+<button class="secondary-button" onclick="loadBaselineOverview()">Refresh</button>
+<button onclick="captureMissingBaselines()">Capture Missing Code Baselines</button>
 </div>
-<button aria-label="Toggle Scenario Registry" class="accordion-toggle" tabindex="-1" type="button">›</button></div><div class="accordion-body">
-<div class="result-area" id="scenarioList">
-                Loading scenarios...
+<button aria-label="Toggle Scenario Baselines" class="accordion-toggle" tabindex="-1" type="button">›</button></div><div class="accordion-body">
+<div class="baseline-overview" id="baselineOverview">
+                Loading scenario baselines...
             </div>
-<div class="scenario-pager" id="scenarioPager"></div>
+<div class="baseline-history-toolbar">
+<label for="baselineScenarioSelect">Code version history</label>
+<div class="form-row compact-row">
+<select id="baselineScenarioSelect">
+<option value="">Select an operation scenario...</option>
+</select>
+<button onclick="loadBaselineHistory()">View History</button>
+</div>
+</div>
+<div class="result-area compact-result" id="baselineResult">
+                Select an operation scenario above to view code versions and testing baselines.
+            </div>
+
 </div></section>
+<!-- ====================================================== -->
+<!-- FULL SCENARIO RAG REGISTRY -->
+<!-- ====================================================== -->
+<section class="card accordion-card is-collapsed" id="scenarioRagRegistryCard">
+<div aria-expanded="false" class="card-header accordion-header" data-accordion-title="Full Scenario RAG Registry" role="button" tabindex="0">
+<div>
+<h2>Full Scenario RAG Registry</h2>
+<p>Search scenario definitions, flows, JIRAs, releases, versions and testing baselines.</p>
+</div>
+<button aria-label="Toggle Full Scenario RAG Registry" class="accordion-toggle" tabindex="-1" type="button">›</button></div><div class="accordion-body">
+<div class="form-row">
+<input id="scenarioRagQuery" placeholder="Ask: where was gpa changed, which scenarios covered it, and in which release?" type="text"/>
+<button onclick="searchScenarioRagRegistry()" type="button">Search Registry</button>
+<button class="secondary-button" type="button" onclick="runScenarioRagEvaluation()">Run RAG Evaluation</button>
+<button class="secondary-button" onclick="rebuildScenarioRagRegistry()" type="button">Rebuild Index</button>
+</div>
+<div class="result-area" id="scenarioRagRegistryResult">
+Search scenario knowledge across release/version/test/JIRA history.
+</div>
+</div></section>
+
+
+<!-- ====================================================== -->
+
 <!-- ====================================================== -->
 <!-- DEFECT INVESTIGATION -->
 <!-- ====================================================== -->
@@ -247,36 +278,7 @@ Select a scenario to reuse its endpoint and test data, or continue manually belo
             </div>
 </div></section>
 <!-- ====================================================== -->
-<!-- BASELINE OVERVIEW / HISTORY -->
-<!-- ====================================================== -->
-<section class="card accordion-card is-collapsed" id="scenario-baselines">
-<div aria-expanded="false" class="card-header accordion-header" data-accordion-title="Scenario Baselines" role="button" tabindex="0">
-<div>
-<h2>Scenario Baselines</h2>
-<p>One scenario per HTTP operation. Keep code versions separate from repeatable monthly/testing baselines.</p>
-</div>
-<div class="header-actions">
-<button class="secondary-button" onclick="loadBaselineOverview()">Refresh</button>
-<button onclick="captureMissingBaselines()">Capture Missing Code Baselines</button>
-</div>
-<button aria-label="Toggle Scenario Baselines" class="accordion-toggle" tabindex="-1" type="button">›</button></div><div class="accordion-body">
-<div class="baseline-overview" id="baselineOverview">
-                Loading scenario baselines...
-            </div>
-<div class="baseline-history-toolbar">
-<label for="baselineScenarioSelect">Code version history</label>
-<div class="form-row compact-row">
-<select id="baselineScenarioSelect">
-<option value="">Select an operation scenario...</option>
-</select>
-<button onclick="loadBaselineHistory()">View History</button>
-</div>
-</div>
-<div class="result-area compact-result" id="baselineResult">
-                Select an operation scenario above to view code versions and testing baselines.
-            </div>
 
-</div></section>
 
 <!-- ====================================================== -->
 <!-- CODE DASHBOARD -->
@@ -318,6 +320,29 @@ Select a scenario to reuse its endpoint and test data, or continue manually belo
 Select a JIRA to see covered baselines.
 </div>
 </div></section>
+<!-- SCENARIO REGISTRY -->
+<!-- ====================================================== -->
+<section class="card accordion-card is-collapsed" id="scenario-registry">
+<div aria-expanded="false" class="card-header accordion-header" data-accordion-title="Scenario Registry" role="button" tabindex="0">
+<div>
+<h2>
+                        Scenario Registry
+                    </h2>
+<p>
+                        Registered application scenarios
+                    </p>
+</div>
+<div class="header-actions">
+<button type="button" onclick="openNewScenarioModal()">+ New Scenario</button>
+<button type="button" class="secondary-button" onclick="refreshScenarioRegistryAndDefect()">Refresh</button>
+</div>
+<button aria-label="Toggle Scenario Registry" class="accordion-toggle" tabindex="-1" type="button">›</button></div><div class="accordion-body">
+<div class="result-area" id="scenarioList">
+                Loading scenarios...
+            </div>
+<div class="scenario-pager" id="scenarioPager"></div>
+</div></section>
+
 <!-- ====================================================== -->
 </main>
 </div>
@@ -358,8 +383,10 @@ Loading operations that are not yet represented in Scenario Baselines...
 <label>Scenario Name
 <input id="newScenarioName" placeholder="e.g. Student Address Update" type="text"/>
 </label>
-<label>JIRA ID <span class="muted-text">(optional)</span>
-<input id="newScenarioJiraId" placeholder="e.g. STUD-303" type="text"/>
+<label>Related JIRA <span class="muted-text">(optional)</span>
+<select id="newScenarioJiraId">
+<option value="">-- No JIRA --</option>
+</select>
 </label>
 <label>Description <span class="muted-text">(optional)</span>
 <textarea id="newScenarioDescription" placeholder="What business/test scenario does this represent?"></textarea>
@@ -404,18 +431,23 @@ Loading operations that are not yet represented in Scenario Baselines...
 </div>
 <div class="scenario-create-form">
 <div class="scenario-create-scroll">
-<label>Release
-<select id="mainBaselineReleaseSelect" onchange="onMainBaselineReleaseChanged()">
-<option value="__new__">+ New Release</option>
+<div class="scenario-create-grid">
+<label>Month *
+<select id="mainBaselineMonth" onchange="updateMainBaselineVersionPreview()">
+<option value="">Select month...</option>
+<option>January</option><option>February</option><option>March</option><option>April</option>
+<option>May</option><option>June</option><option>July</option><option>August</option>
+<option>September</option><option>October</option><option>November</option><option>December</option>
 </select>
 </label>
-<label id="mainBaselineNameWrap">Release Name
-<input id="mainBaselineName" oninput="updateMainBaselineVersionPreview()" placeholder="e.g. October 2026" type="text"/>
+<label>Year *
+<select id="mainBaselineYear" onchange="updateMainBaselineVersionPreview()"></select>
 </label>
+</div>
 <label>Version
 <input id="mainBaselineVersionDisplay" readonly type="text" value="V1"/>
 </label>
-<div class="scenario-create-help">Choose an existing release to create its next version, or create a new release starting at V1. A version is saved only after the operation flow is analysed successfully.</div>
+<div class="scenario-create-help">Month and year are mandatory. Version is generated automatically: the first baseline for a month is V1, then V2, V3, and so on.</div>
 <div aria-live="polite" class="scenario-create-error" id="mainBaselineError"></div>
 </div>
 <div class="scenario-create-actions">
@@ -557,8 +589,8 @@ Loading operations that are not yet represented in Scenario Baselines...
 </details>
 </div>
 </div>
-<script src="/static/app.js?v=jira-history-text-1"></script>
-<script src="/static/project-ui.js?v=scenario-edit-modal-1"></script>
+<script src="/static/app.js?v=baseline-month-year-1"></script>
+<script src="/static/project-ui.js?v=jira-dropdown-1"></script>
 <script src="/static/flowchart-ui.js?v=3"></script>
 <script src="/static/jira-impact.js?v=3"></script>
 <script src="/static/attribute-impact.js?v=2"></script>

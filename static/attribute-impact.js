@@ -26,10 +26,11 @@ function renderAttributeImpact(data) {
     const scenarios = data.affected_scenarios || [];
     const confidence = data.confidence || {};
     const relatedJiras = data.related_jiras || [];
+    const history = data.historical_traceability || [];
 
     const layerHtml = layers.length ? layers.map(layer => `
         <div class="attribute-layer-card">
-            <div class="attribute-layer-role">${escapeHtml(layer.role || "PYTHON_SYMBOL")}</div>
+            <div class="attribute-layer-role">${escapeHtml(layer.role || "PYTHON_CLASS")}</div>
             ${(layer.classes || []).map(name => `<div class="attribute-class-name">${escapeHtml(name)}</div>`).join("")}
             ${(layer.methods || []).length ? `
                 <div class="muted-text attribute-methods">${(layer.methods || []).map(escapeHtml).join(" · ")}</div>
@@ -46,6 +47,19 @@ function renderAttributeImpact(data) {
             <span class="tag">${escapeHtml(endpoint.relevance || "FLOW")}</span>
             ${(endpoint.matched_methods || []).length ? `<div class="attribute-evidence">Direct methods: ${endpoint.matched_methods.map(escapeHtml).join(", ")}</div>` : ""}
             ${(endpoint.matched_classes || []).length ? `<div class="attribute-evidence">Classes: ${endpoint.matched_classes.map(escapeHtml).join(", ")}</div>` : ""}
+            ${(endpoint.branch_evidence || []).length ? `
+                <div class="attribute-evidence">
+                    <strong>Branch evidence:</strong>
+                    ${(endpoint.branch_evidence || []).map(branch => `
+                        <div>
+                            ${escapeHtml(branch.branch_type || "IF")}: ${escapeHtml(branch.condition || "")}
+                            ${branch.class_name || branch.method_name
+                                ? ` · ${escapeHtml(branch.class_name || "")}${branch.class_name && branch.method_name ? "." : ""}${escapeHtml(branch.method_name || "")}`
+                                : ""}
+                        </div>
+                    `).join("")}
+                </div>
+            ` : ""}
             ${(endpoint.dependency_path || []).length ? `
                 <div class="dependency-path-inline">
                     ${(endpoint.dependency_path || []).map(step => `<span>${escapeHtml(step)}</span>`).join(`<b>→</b>`)}
@@ -66,53 +80,35 @@ function renderAttributeImpact(data) {
         </div>
     `).join("") : `<div class="muted-box">No saved JIRA requirement matched this attribute yet.</div>`;
 
-    const scenarioHtml = scenarios.length ? scenarios.map(scenario => {
-        const releases = scenario.release_history || [];
-        const releaseHistory = releases.length ? `
-            <div class="attribute-release-history">
-                <div class="attribute-release-title">Release / Version history</div>
-                ${releases.map(release => `
-                    <div class="attribute-release-group">
-                        <div class="attribute-release-name">${escapeHtml(release.release || "Legacy")}</div>
-                        <div class="attribute-release-versions">
-                            ${(release.versions || []).map(version => `
-                                <div class="attribute-release-version ${version.is_active ? "is-active" : ""}">
-                                    <div class="attribute-release-version-head">
-                                        <strong>V${Number(version.release_version || 1)}</strong>
-                                        ${version.is_active ? `<span class="tag">ACTIVE</span>` : ``}
-                                    </div>
-                                    ${(version.tests || []).length ? (version.tests || []).map(test => `
-                                        <div class="attribute-linked-test">
-                                            <span>${escapeHtml(test.test_scenario || "Test Scenario")}</span>
-                                            <span class="tag">${escapeHtml(test.status || "NOT_RUN")}</span>
-                                            <div class="attribute-linked-jiras">
-                                                ${(test.jira_ids || []).length
-                                                    ? (test.jira_ids || []).map(id => `<span class="testing-jira-chip">${escapeHtml(id)}</span>`).join("")
-                                                    : `<span class="muted-text">No JIRA</span>`}
-                                            </div>
-                                        </div>
-                                    `).join("") : `<div class="muted-text">No test baseline linked to this version.</div>`}
-                                </div>
-                            `).join("")}
-                        </div>
-                    </div>
-                `).join("")}
+    const scenarioHtml = scenarios.length ? scenarios.map(scenario => `
+        <div class="attribute-impact-row">
+            <div>
+                <strong>${escapeHtml(scenario.scenario_code || "")}</strong>
+                <div class="muted-text">${escapeHtml(scenario.http_method || "")} ${escapeHtml(scenario.endpoint || "")}</div>
             </div>
-        ` : `<div class="muted-text attribute-no-release">No release baseline captured for this scenario yet.</div>`;
+            ${(scenario.reasons || []).map(reason => `<div class="attribute-evidence">• ${escapeHtml(reason)}</div>`).join("")}
+        </div>
+    `).join("") : `<div class="muted-box">No registered scenario intersects this attribute yet.</div>`;
 
+    const historyHtml = history.length ? history.map(item => {
+        const jiraIds = item.jira_ids || [];
+        const jiraDetails = item.jiras || [];
+        const releaseVersion = item.release_version ? `V${item.release_version}` : "";
+        const codeVersion = item.code_baseline_version ? `V${item.code_baseline_version}` : "";
         return `
             <div class="attribute-impact-row">
-                <div class="attribute-scenario-heading">
-                    <div>
-                        <strong>${escapeHtml(scenario.scenario_code || "")}</strong>
-                        <div class="muted-text">${escapeHtml(scenario.http_method || "")} ${escapeHtml(scenario.endpoint || "")}</div>
-                    </div>
+                <div>
+                    <strong>${escapeHtml(item.scenario_code || "")}</strong>
+                    <div class="muted-text">${escapeHtml(item.http_method || "")} ${escapeHtml(item.endpoint || "")}</div>
                 </div>
-                ${(scenario.reasons || []).map(reason => `<div class="attribute-evidence">• ${escapeHtml(reason)}</div>`).join("")}
-                ${releaseHistory}
+                <div class="attribute-evidence"><strong>Test baseline:</strong> ${escapeHtml(item.test_baseline || "No test baseline")}${item.test_status ? ` · ${escapeHtml(item.test_status)}` : ""}</div>
+                <div class="attribute-evidence"><strong>Release:</strong> ${escapeHtml(item.release || "Legacy")} ${escapeHtml(releaseVersion)}</div>
+                <div class="attribute-evidence"><strong>Code baseline:</strong> ${escapeHtml(codeVersion || "—")}</div>
+                <div class="attribute-evidence"><strong>JIRA:</strong> ${jiraIds.length ? jiraIds.map(escapeHtml).join(", ") : "—"}</div>
+                ${jiraDetails.filter(j => j && j.title).map(j => `<div class="muted-text">${escapeHtml(j.jira_id || "")} · ${escapeHtml(j.title || "")}</div>`).join("")}
             </div>
         `;
-    }).join("") : `<div class="muted-box">No registered scenario intersects this attribute yet.</div>`;
+    }).join("") : `<div class="muted-box">No captured release/test baseline is traceable to this attribute yet.</div>`;
 
     return `
         <div class="attribute-impact-summary">
@@ -140,10 +136,15 @@ function renderAttributeImpact(data) {
         </div>
 
         <div class="attribute-impact-section">
+            <h3>Historical Traceability</h3>
+            ${historyHtml}
+        </div>
+
+        <div class="attribute-impact-section">
             <h3>Related JIRAs</h3>
             ${jiraHtml}
         </div>
 
-        <div class="muted-text attribute-local-note">LangGraph parallel analysis · code impact finds the scenario; exact Release/Version/Test/JIRA history comes from the baseline database · local JIRA RAG supplies semantic JIRA evidence.</div>
+        <div class="muted-text attribute-local-note">LangGraph parallel analysis · local Python analysis + local JIRA RAG · no external LLM required.</div>
     `;
 }

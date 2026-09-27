@@ -4,7 +4,7 @@ from fastapi import FastAPI
 import logging
 
 from config import settings
-from database import engine, initialize_storage, storage_status
+from database import engine, initialize_storage, storage_status, SessionLocal
 # Import ORM models before create_all so a fresh CodeIntelligence database
 # creates both scenario and baseline tables correctly.
 import db_models  # noqa: F401
@@ -62,8 +62,9 @@ def _ensure_scenario_registry_columns():
 
 
 
+
 def _ensure_scenario_baseline_columns():
-    """Additive upgrade for Release/Version baseline metadata."""
+    """Additive upgrade for named Main Baselines."""
     required_columns = {
         "baseline_name": "VARCHAR(150)",
         "release_version": "INTEGER",
@@ -79,8 +80,7 @@ def _ensure_scenario_baseline_columns():
                 if name not in existing:
                     connection.execute(text(f"ALTER TABLE scenario_baselines ADD COLUMN {name} {sql_type}"))
     except Exception as exc:
-        raise RuntimeError(f"Unable to upgrade baseline database schema: {exc}") from exc
-
+        raise RuntimeError(f"Unable to upgrade Main Baseline database schema: {exc}") from exc
 
 def _ensure_testing_baseline_columns():
     """Additive upgrade for periodic testing-baseline metadata."""
@@ -191,6 +191,7 @@ from routers.excel_report_router import (
 )
 from routers.jira_impact_router import router as jira_impact_router
 from routers.jira_knowledge_router import router as jira_knowledge_router
+from routers.scenario_rag_registry_router import router as scenario_rag_registry_router
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -227,6 +228,7 @@ app.include_router(
     jira_impact_router
 )
 app.include_router(jira_knowledge_router)
+app.include_router(scenario_rag_registry_router)
 
 app.include_router(
     scenario_router
@@ -287,7 +289,7 @@ app.include_router(
 @app.on_event("startup")
 def startup():
 
-    seed_scenarios()
+    #seed_scenarios()
 
     initialization = {
         "enabled": settings.AUTO_PROJECT_INITIALIZATION,
@@ -302,17 +304,26 @@ def startup():
             scan_result = scanner_service.scan()
             initialization["scan"] = {
                 "project_path": scan_result.project_path,
-                "total_python_files": scan_result.total_java_files,
                 "total_java_files": scan_result.total_java_files,
                 "total_classes": len(scan_result.classes)
             }
 
             rag_result = rag_service.index_project()
             initialization["rag"] = rag_result
+
+            # Keep operation-level Scenario Registry in sync on automatic startup.
+            startup_db = SessionLocal()
+            try:
+                initialization["scenario_sync"] = (
+                    ScenarioService().sync_discovered_operations(startup_db)
+                )
+            finally:
+                startup_db.close()
+
             initialization["status"] = "READY"
 
             logger.info(
-                "Project initialization completed: %s Python files, %s RAG chunks",
+                "Project initialization completed: %s Java files, %s RAG chunks",
                 scan_result.total_java_files,
                 rag_result.get("chunks")
             )
@@ -344,6 +355,7 @@ def health():
         "status": "UP",
         "app": settings.APP_NAME,
         "version": settings.APP_VERSION,
-        "python_project_path": settings.PYTHON_PROJECT_PATH,
+        "java_project_path": settings.JAVA_PROJECT_PATH,
         "project_initialization": initialization
     }
+from services.scenario.scenario_service import ScenarioService
