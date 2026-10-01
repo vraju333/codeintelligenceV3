@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import ast
 import hashlib
 import json
 import re
@@ -12,360 +15,189 @@ from config import settings
 
 
 class RagService:
+    IGNORED_DIRS = {".git", ".venv", "venv", "env", "__pycache__", "site-packages", "build", "dist"}
 
     def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
-        )
-
+        self.embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         self.splitter = RecursiveCharacterTextSplitter.from_language(
-            language=Language.JAVA,
-            chunk_size=1200,
-            chunk_overlap=150
+            language=Language.PYTHON, chunk_size=1200, chunk_overlap=150
         )
-
-        # Keep one RAG index per Java project.  This prevents a project switch
-        # from accidentally reusing another project's FAISS files.
         self.index_root = Path("rag_indexes")
         self.index_root.mkdir(parents=True, exist_ok=True)
-
         self.vector_store: FAISS | None = None
         self.current_project_key: str | None = None
         self.current_index_path: Path | None = None
-
         self._load_current_project_index_if_valid()
 
     def index_project(self, force: bool = False) -> dict:
         root = self._project_root()
-        java_files = sorted(root.rglob("*.java"))
-
+        py_files = self._python_files(root)
         project_key = self._project_key(root)
         index_path = self.index_root / project_key
         manifest_path = index_path / "manifest.json"
-        fingerprint = self._project_fingerprint(root, java_files)
+        fingerprint = self._fingerprint(root, py_files)
+        existing = self._read_manifest(manifest_path)
+        index_exists = self._index_exists(index_path)
 
-        existing_manifest = self._read_manifest(manifest_path)
-        index_exists = self._index_files_exist(index_path)
-
-        # If exactly the same source is already indexed, simply load/reuse it.
-        if (
-            not force
-            and index_exists
-            and existing_manifest
-            and existing_manifest.get("project_path") == str(root.resolve())
-            and existing_manifest.get("fingerprint") == fingerprint
-        ):
+        if not force and index_exists and existing and existing.get("project_path") == str(root) and existing.get("fingerprint") == fingerprint:
             self._load_index(index_path, project_key)
-            return self._result_from_manifest(
-                existing_manifest,
-                status="reused",
-                message="Project source is unchanged; existing project-specific RAG index reused."
-            )
+            return {**existing, "status": "reused", "message": "Python source is unchanged; existing RAG index reused."}
 
-        # If an index exists for this project but the source fingerprint changed,
-        # rebuild it in place.  Otherwise this is the first index for the project.
-        status = "updated" if index_exists or existing_manifest else "created"
-
-        documents: list[Document] = []
-
-        for java_file in java_files:
-            content = java_file.read_text(
-                encoding="utf-8",
-                errors="ignore"
-            )
-
-            class_name = self._extract_class_name(content)
-            package_name = self._extract_package(content)
-            methods = self._extract_methods(content)
-
-            common_metadata = {
-                "file_name": java_file.name,
-                "file_path": str(java_file.resolve()),
-                "relative_path": str(java_file.relative_to(root)),
-                "package_name": package_name,
-                "class_name": class_name,
-                "language": "java",
+        documents = []
+        for path in py_files:
+            source = path.read_text(encoding="utf-8", errors="ignore")
+            try:
+                tree = ast.parse(source, filename=str(path))
+            except SyntaxError:
+                tree = None
+            module_name = self._module_name(root, path)
+            chunks = self._ast_chunks(source, tree) if tree else []
+            metadata = {
+                "file_name": path.name,
+                "file_path": str(path),
+                "relative_path": str(path.relative_to(root)),
+                "package_name": module_name,
+                "class_name": path.stem,
+                "language": "python",
                 "project_key": project_key,
-                "project_path": str(root.resolve())
+                "project_path": str(root),
             }
-
-            if methods:
-                for method_name, method_content in methods:
-                    documents.append(
-                        Document(
-                            page_content=method_content,
-                            metadata={
-                                **common_metadata,
-                                "method_name": method_name,
-                                "chunk_type": "method"
-                            }
-                        )
-                    )
+            if chunks:
+                for owner, method, text in chunks:
+                    documents.append(Document(page_content=text, metadata={
+                        **metadata,
+                        "class_name": owner or path.stem,
+                        "method_name": method,
+                        "chunk_type": "function" if method else "class",
+                    }))
             else:
-                documents.append(
-                    Document(
-                        page_content=content,
-                        metadata={
-                            **common_metadata,
-                            "method_name": None,
-                            "chunk_type": "class"
-                        }
-                    )
-                )
+                documents.append(Document(page_content=source, metadata={**metadata, "method_name": None, "chunk_type": "module"}))
 
         if not documents:
-            self.vector_store = None
-            raise RuntimeError(
-                f"No Java source documents were found under: {root}"
-            )
+            raise RuntimeError(f"No Python source documents were found under: {root}")
 
-        chunks = self.splitter.split_documents(documents)
-
-        self.vector_store = FAISS.from_documents(
-            documents=chunks,
-            embedding=self.embeddings
-        )
-
+        split_docs = self.splitter.split_documents(documents)
+        self.vector_store = FAISS.from_documents(split_docs, self.embeddings)
         index_path.mkdir(parents=True, exist_ok=True)
         self.vector_store.save_local(str(index_path))
 
+        status = "updated" if index_exists or existing else "created"
         manifest = {
             "project_key": project_key,
             "project_name": root.name,
-            "project_path": str(root.resolve()),
+            "project_path": str(root),
             "fingerprint": fingerprint,
-            "java_files": len(java_files),
+            "python_files": len(py_files),
             "documents": len(documents),
-            "chunks": len(chunks)
+            "chunks": len(split_docs),
         }
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2),
-            encoding="utf-8"
-        )
-
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         self.current_project_key = project_key
         self.current_index_path = index_path
+        return {**manifest, "index_path": str(index_path), "status": status,
+                "message": "Existing Python index updated because source changed." if status == "updated" else "New Python project-specific RAG index created."}
 
-        return {
-            **manifest,
-            "index_path": str(index_path),
-            "status": status,
-            "message": (
-                "Existing index updated because Java source changed."
-                if status == "updated"
-                else "New project-specific RAG index created."
-            )
-        }
-
-    def search(
-        self,
-        query: str,
-        top_k: int = 5
-    ) -> list[dict]:
-        # Protect against a stale in-memory vector store if JAVA_PROJECT_PATH
-        # points at a different project on a newly started process/configuration.
-        expected_key = self._project_key(self._project_root())
-        if self.current_project_key != expected_key:
+    def search(self, query: str, top_k: int = 5) -> list[dict]:
+        expected = self._project_key(self._project_root())
+        if self.current_project_key != expected:
             self.index_project()
-
         if self.vector_store is None:
-            raise RuntimeError(
-                "RAG index does not exist. Call /api/rag/index first."
-            )
-
-        matches = self.vector_store.similarity_search_with_score(
-            query=query,
-            k=top_k
-        )
-
-        results = []
-
-        for document, score in matches:
-            results.append(
-                {
-                    "file_name": document.metadata.get("file_name"),
-                    "class_name": document.metadata.get("class_name"),
-                    "method_name": document.metadata.get("method_name"),
-                    "chunk_type": document.metadata.get("chunk_type"),
-                    "file_path": document.metadata.get("file_path"),
-                    "project_key": document.metadata.get("project_key"),
-                    "similarity_score": float(score),
-                    "content": document.page_content
-                }
-            )
-
-        return results
+            raise RuntimeError("RAG index does not exist. Call /api/rag/index first.")
+        matches = self.vector_store.similarity_search_with_score(query=query, k=top_k)
+        return [{
+            "file_name": doc.metadata.get("file_name"),
+            "class_name": doc.metadata.get("class_name"),
+            "method_name": doc.metadata.get("method_name"),
+            "chunk_type": doc.metadata.get("chunk_type"),
+            "file_path": doc.metadata.get("file_path"),
+            "project_key": doc.metadata.get("project_key"),
+            "similarity_score": float(score),
+            "content": doc.page_content,
+        } for doc, score in matches]
 
     def _load_current_project_index_if_valid(self):
         try:
             root = self._project_root()
         except RuntimeError:
-            self.vector_store = None
             return
+        files = self._python_files(root)
+        key = self._project_key(root)
+        path = self.index_root / key
+        manifest = self._read_manifest(path / "manifest.json")
+        if manifest and self._index_exists(path) and manifest.get("fingerprint") == self._fingerprint(root, files):
+            try:
+                self._load_index(path, key)
+            except Exception:
+                self.vector_store = None
 
-        java_files = sorted(root.rglob("*.java"))
-        project_key = self._project_key(root)
-        index_path = self.index_root / project_key
-        manifest = self._read_manifest(index_path / "manifest.json")
-
-        if not manifest or not self._index_files_exist(index_path):
-            self.vector_store = None
-            return
-
-        fingerprint = self._project_fingerprint(root, java_files)
-        if (
-            manifest.get("project_path") != str(root.resolve())
-            or manifest.get("fingerprint") != fingerprint
-        ):
-            self.vector_store = None
-            return
-
-        try:
-            self._load_index(index_path, project_key)
-        except Exception:
-            self.vector_store = None
-            self.current_project_key = None
-            self.current_index_path = None
-
-    def _load_index(self, index_path: Path, project_key: str):
-        self.vector_store = FAISS.load_local(
-            str(index_path),
-            self.embeddings,
-            allow_dangerous_deserialization=True
-        )
-        self.current_project_key = project_key
-        self.current_index_path = index_path
+    def _load_index(self, path: Path, key: str):
+        self.vector_store = FAISS.load_local(str(path), self.embeddings, allow_dangerous_deserialization=True)
+        self.current_project_key = key
+        self.current_index_path = path
 
     def _project_root(self) -> Path:
-        project_path = settings.JAVA_PROJECT_PATH
-        if not project_path:
-            raise RuntimeError("JAVA_PROJECT_PATH is not configured")
+        raw = settings.PYTHON_PROJECT_PATH
+        if not raw:
+            raise RuntimeError("PYTHON_PROJECT_PATH is not configured")
+        root = Path(raw).expanduser().resolve()
+        if not root.exists() or not root.is_dir():
+            raise RuntimeError(f"Python project path does not exist: {raw}")
+        return root
 
-        root = Path(project_path).expanduser()
-        if not root.exists():
-            raise RuntimeError(
-                f"Project path does not exist: {project_path}"
-            )
-        if not root.is_dir():
-            raise RuntimeError(
-                f"JAVA_PROJECT_PATH must point to a directory: {project_path}"
-            )
-        return root.resolve()
+    def _python_files(self, root: Path) -> list[Path]:
+        return sorted(p for p in root.rglob("*.py") if not any(part in self.IGNORED_DIRS for part in p.parts))
 
-    def _project_key(self, root: Path) -> str:
-        # Folder name keeps it readable; path hash avoids collisions between
-        # projects with the same directory name in different locations.
-        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", root.name).strip("-") or "java-project"
-        path_hash = hashlib.sha1(
-            str(root.resolve()).lower().encode("utf-8")
-        ).hexdigest()[:10]
-        return f"{safe_name}-{path_hash}"
+    @staticmethod
+    def _project_key(root: Path) -> str:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", root.name).strip("-") or "python-project"
+        digest = hashlib.sha1(str(root).lower().encode()).hexdigest()[:10]
+        return f"{safe}-{digest}"
 
-    def _project_fingerprint(self, root: Path, java_files: list[Path]) -> str:
+    @staticmethod
+    def _fingerprint(root: Path, files: list[Path]) -> str:
         digest = hashlib.sha256()
-        for java_file in java_files:
-            relative = str(java_file.relative_to(root)).replace("\\", "/")
-            digest.update(relative.encode("utf-8"))
+        for path in files:
+            digest.update(str(path.relative_to(root)).replace("\\", "/").encode())
             digest.update(b"\0")
-            try:
-                digest.update(java_file.read_bytes())
-            except OSError:
-                # The scanner would also fail to meaningfully analyze a file that
-                # cannot be read; including a marker ensures the fingerprint is
-                # deterministic instead of silently matching stale content.
-                digest.update(b"<unreadable>")
+            digest.update(path.read_bytes())
             digest.update(b"\0")
         return digest.hexdigest()
 
-    def _index_files_exist(self, index_path: Path) -> bool:
-        return (
-            (index_path / "index.faiss").is_file()
-            and (index_path / "index.pkl").is_file()
-        )
+    @staticmethod
+    def _index_exists(path: Path) -> bool:
+        return (path / "index.faiss").is_file() and (path / "index.pkl").is_file()
 
-    def _read_manifest(self, manifest_path: Path) -> dict | None:
-        if not manifest_path.is_file():
-            return None
+    @staticmethod
+    def _read_manifest(path: Path):
         try:
-            return json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+        except Exception:
             return None
 
-    def _result_from_manifest(self, manifest: dict, status: str, message: str) -> dict:
-        project_key = manifest.get("project_key")
-        index_path = self.index_root / project_key
-        return {
-            **manifest,
-            "index_path": str(index_path),
-            "status": status,
-            "message": message
-        }
+    @staticmethod
+    def _module_name(root: Path, path: Path) -> str:
+        rel = path.relative_to(root).with_suffix("")
+        parts = list(rel.parts)
+        if parts and parts[-1] == "__init__": parts = parts[:-1]
+        return ".".join(parts)
 
-    def _extract_package(self, content: str) -> str | None:
-        match = re.search(r"package\s+([\w.]+)\s*;", content)
-        return match.group(1) if match else None
-
-    def _extract_class_name(self, content: str) -> str | None:
-        match = re.search(r"\b(class|interface|enum|record)\s+(\w+)", content)
-        return match.group(2) if match else None
-
-    def _extract_methods(self, content: str) -> list[tuple[str, str]]:
-        method_pattern = re.compile(
-            r"""
-            (?:public|protected|private)
-            \s+
-            (?:static\s+)?
-            (?:final\s+)?
-            (?:synchronized\s+)?
-            (?:<[^>]+>\s+)?
-            [\w<>\[\],.?]+\s+
-            (?P<method_name>\w+)
-            \s*
-            \([^)]*\)
-            \s*
-            (?:throws\s+[^{]+)?
-            \{
-            """,
-            re.VERBOSE | re.MULTILINE
-        )
-
-        methods = []
-        for match in method_pattern.finditer(content):
-            method_name = match.group("method_name")
-            opening_brace = content.find("{", match.start())
-            closing_brace = self._find_matching_brace(content, opening_brace)
-            if closing_brace == -1:
-                continue
-            method_content = content[match.start():closing_brace + 1]
-            methods.append((method_name, method_content.strip()))
-
-        return methods
-
-    def _find_matching_brace(self, content: str, opening_brace: int) -> int:
-        depth = 0
-        in_string = False
-        escape = False
-
-        for index in range(opening_brace, len(content)):
-            character = content[index]
-
-            if character == "\\" and not escape:
-                escape = True
-                continue
-
-            if character == '"' and not escape:
-                in_string = not in_string
-
-            escape = False
-
-            if in_string:
-                continue
-
-            if character == "{":
-                depth += 1
-            elif character == "}":
-                depth -= 1
-                if depth == 0:
-                    return index
-
-        return -1
+    @staticmethod
+    def _ast_chunks(source: str, tree: ast.Module | None):
+        if tree is None:
+            return []
+        result = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                class_text = ast.get_source_segment(source, node) or ""
+                if class_text:
+                    result.append((node.name, None, class_text))
+                for child in node.body:
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        text = ast.get_source_segment(source, child) or ""
+                        if text:
+                            result.append((node.name, child.name, text))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                text = ast.get_source_segment(source, node) or ""
+                if text:
+                    result.append((None, node.name, text))
+        return result

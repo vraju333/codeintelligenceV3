@@ -20,6 +20,7 @@ class InvestigationState(TypedDict, total=False):
     attribute_traces: dict[str, dict]
 
     likely_code_locations: dict[str, list[dict]]
+    value_flow_results: dict[str, dict]
 
     status: str
 
